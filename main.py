@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 import random
+import os
 
 # -------------------------------
 # Game of Life forward simulator
@@ -64,12 +65,12 @@ class GoLReverseDataset(Dataset):
     __getitem__ returns (current_state, prev_state) as float tensors in {0, 1}.
     """
 
-    def __init__(self, n_samples: int, H: int, W: int, density: float = 0.15, mix_steps: int = 0, seed: int = 0):
+    def __init__(self, n_samples: int, H: int, W: int, density: float = 0.15, warmup_steps: int = 0, seed: int = 0):
         self.n = n_samples
         self.H = H
         self.W = W
         self.density = density
-        self.mix_steps = mix_steps
+        self.warmup_steps = warmup_steps
         self.seed = seed
         random.seed(seed)
 
@@ -81,8 +82,8 @@ class GoLReverseDataset(Dataset):
         prev = torch.rand(1, self.H, self.W)
         prev = (prev < self.density).float()
 
-        # Optional mixing to create more natural patterns
-        for _ in range(self.mix_steps):
+        # Optional warmup steps to create more natural patterns
+        for _ in range(self.warmup_steps):
             prev = gol_step(prev.unsqueeze(0)).squeeze(0)
 
         curr = gol_step(prev.unsqueeze(0)).squeeze(0)
@@ -145,8 +146,10 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int) -> RefineOut
         RefineOutput with lists across iterations.
     """
     assert current_bin.dim() == 4 and current_bin.size(1) == 1, f"expected [B,1,H,W], got {tuple(current_bin.shape)}"
-    pred_prev = torch.zeros_like(current_bin)
-    err = torch.zeros_like(current_bin)
+    pred_prev = current_bin
+    next_from_pred = gol_step(pred_prev)
+    mismatch = (next_from_pred != current_bin).float()
+    err = dilate_3x3(mismatch)
 
     logits_hist, probs_hist, bin_hist, err_hist = [], [], [], []
 
@@ -223,7 +226,7 @@ def eval_metrics(model: nn.Module,
     """
     Evaluate:
         - Average BCE loss
-        - Bit accuracy on previous state
+        - Bit accuracy on previous state (excluding trivial cases with no neighbors)
         - Fraction of samples where forward reconstruction exactly matches current
     """
     model.eval()
@@ -247,9 +250,24 @@ def eval_metrics(model: nn.Module,
         # Supervised BCE loss
         total_bce += bce(logits, prev).item()
 
-        # Bit accuracy on previous state
-        correct_prev_bits += (pred_prev == prev).sum().item()
-        total_pixels += prev.numel()
+        # Bit accuracy on previous state (excluding trivial cases)
+        # Create neighbor count mask for current state
+        kernel = torch.tensor(
+            [[1, 1, 1],
+             [1, 0, 1],
+             [1, 1, 1]],
+            dtype=curr.dtype,
+            device=device
+        ).view(1, 1, 3, 3)
+        
+        neighbor_counts = F.conv2d(curr, kernel, padding=1)
+        # Mask for non-trivial cases (where there are neighbors)
+        non_trivial_mask = neighbor_counts > 0
+        
+        # Only count accuracy for non-trivial cases
+        if non_trivial_mask.sum() > 0:
+            correct_prev_bits += ((pred_prev == prev) & non_trivial_mask).sum().item()
+            total_pixels += non_trivial_mask.sum().item()
 
         # Exact forward reconstruction check per sample
         recon = gol_step(pred_prev)
@@ -454,16 +472,17 @@ def visualize_reverse_gol(checkpoint_path: str,
 # Main
 # -------------------------------
 
-def main():
+def train_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     H, W = 64, 64
 
-    train_ds = GoLReverseDataset(n_samples=8000, H=H, W=W, density=0.15, mix_steps=2, seed=1)
-    val_ds = GoLReverseDataset(n_samples=1000, H=H, W=W, density=0.15, mix_steps=2, seed=2)
+    train_ds = GoLReverseDataset(n_samples=8000, H=H, W=W, density=0.15, warmup_steps=10, seed=1)
+    val_ds = GoLReverseDataset(n_samples=1000, H=H, W=W, density=0.15, warmup_steps=10, seed=2)
 
     # Set num_workers=0 for portability across OSes
-    train_dl = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=0)
-    val_dl = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=0)
+    workers = 16
+    train_dl = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=workers)
+    val_dl = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=workers)
 
     model = RefinementCNN(in_ch=3, base=48).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -535,19 +554,19 @@ def main():
 
 
 if __name__ == "__main__":
-    # Check if we have a trained model to visualize
-    import os
-    os.makedirs('checkpoints', exist_ok=True)
+    train = True
     forward_steps=15
     refine_steps=3
-    if os.path.exists('checkpoints/best_model.pth'):
-        print("Found best model, running visualization...")
-        visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=forward_steps, refine_steps=refine_steps)
-    elif os.path.exists('checkpoints/checkpoint_epoch_10.pth'):
-        print("Found epoch 10 checkpoint, running visualization...")
-        visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps=forward_steps, refine_steps=refine_steps)
-    else:
-        print("No trained model found. Running training first...")
-        main()
+    os.makedirs('checkpoints', exist_ok=True)
+    if train:
+        train_model()
         print("\nTraining completed! Now running visualization...")
         visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=forward_steps, refine_steps=refine_steps)
+    else:
+        if os.path.exists('checkpoints/best_model.pth'):
+            print("Found best model, running visualization...")
+            visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=forward_steps, refine_steps=refine_steps)
+        elif os.path.exists('checkpoints/checkpoint_epoch_10.pth'):
+            print("Found epoch 10 checkpoint, running visualization...")
+            visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps=forward_steps, refine_steps=refine_steps)
+
