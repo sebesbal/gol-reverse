@@ -335,8 +335,8 @@ def visualize_reverse_gol(checkpoint_path: str,
     ground_truth_states = list(reversed(states_forward[:-1]))  # Exclude final state
     
     # Create visualization with only 2 rows (ground truth and model reconstruction)
-    # Align corresponding states vertically
-    n_steps = max(len(ground_truth_states) + 1, len(reconstructed_states) + 1)
+    # Show only refine_steps + 1 columns (input state + refinement steps)
+    n_steps = refine_steps + 1
     fig, axes = plt.subplots(2, n_steps, figsize=(15, 6))
     fig.suptitle(f'Game of Life Reverse Process Visualization\n'
                  f'Model: Epoch {checkpoint["epoch"]}, '
@@ -352,7 +352,7 @@ def visualize_reverse_gol(checkpoint_path: str,
         if i == 0:
             axes[0, i].set_title('Input State', fontweight='bold', fontsize=10)
         else:
-            axes[0, i].set_title(f'Step {i-1}', fontweight='bold', fontsize=10)
+            axes[0, i].set_title(f'Refinement {i}', fontweight='bold', fontsize=10)
     
     # Row labels
     axes[0, 0].text(-0.3, 0.5, 'Ground Truth\n(Reverse)', transform=axes[0, 0].transAxes, 
@@ -367,15 +367,16 @@ def visualize_reverse_gol(checkpoint_path: str,
     axes[0, 0].text(0.5, -0.1, f'{final_state.sum().item():.0f} cells (input)', 
                     ha='center', transform=axes[0, 0].transAxes, fontsize=8)
     
-    # Subsequent columns: ground truth reverse states
-    for i, state in enumerate(ground_truth_states):
+    # Subsequent columns: ground truth reverse states (show only up to refine_steps)
+    for i in range(min(len(ground_truth_states), refine_steps)):
+        state = ground_truth_states[i]
         axes[0, i+1].imshow(state.squeeze().cpu(), cmap='gray', vmin=0, vmax=1)
         axes[0, i+1].axis('off')
         axes[0, i+1].text(0.5, -0.1, f'{state.sum().item():.0f} cells', 
                         ha='center', transform=axes[0, i+1].transAxes, fontsize=8)
     
     # Hide unused subplots in first row
-    for i in range(len(ground_truth_states) + 1, n_steps):
+    for i in range(min(len(ground_truth_states), refine_steps) + 1, n_steps):
         axes[0, i].axis('off')
     
     # Row 2: Model reconstruction
@@ -385,9 +386,9 @@ def visualize_reverse_gol(checkpoint_path: str,
     axes[1, 0].text(0.5, -0.1, f'{final_state.sum().item():.0f} cells (input)', 
                     ha='center', transform=axes[1, 0].transAxes, fontsize=8)
     
-    # Subsequent columns: model reconstruction iterations in reverse order
-    reversed_reconstructed_states = list(reversed(reconstructed_states))
-    for i, recon_state in enumerate(reversed_reconstructed_states):
+    # Subsequent columns: model reconstruction iterations (show only up to refine_steps)
+    for i in range(min(len(reconstructed_states), refine_steps)):
+        recon_state = reconstructed_states[i]
         if i < len(ground_truth_states):
             gt_state = ground_truth_states[i].to(device)
             # 0 = no difference, 1 = model alive but GT dead, 2 = model dead but GT alive
@@ -415,7 +416,7 @@ def visualize_reverse_gol(checkpoint_path: str,
                             ha='center', transform=axes[1, i+1].transAxes, fontsize=8)
     
     # Hide unused subplots in second row
-    for i in range(len(reversed_reconstructed_states) + 1, n_steps):
+    for i in range(min(len(reconstructed_states), refine_steps) + 1, n_steps):
         axes[1, i].axis('off')
     
     # Add legend for difference visualization
@@ -490,7 +491,7 @@ def main():
             'val_bit_acc': bit_acc,
             'val_recon_ok': recon_ok
         }
-        torch.save(checkpoint, f'checkpoint_epoch_{epoch:02d}.pth')
+        torch.save(checkpoint, f'checkpoints/checkpoint_epoch_{epoch:02d}.pth')
         print(f"Saved checkpoint for epoch {epoch}")
         
         # Save best model based on bit accuracy
@@ -507,7 +508,7 @@ def main():
                 'val_recon_ok': recon_ok,
                 'best_bit_acc': best_bit_acc
             }
-            torch.save(best_checkpoint, 'best_model.pth')
+            torch.save(best_checkpoint, 'checkpoints/best_model.pth')
             print(f"New best model saved! Bit accuracy: {bit_acc:.4f}")
 
     print(f"\nTraining completed!")
@@ -528,22 +529,25 @@ def main():
     
     # Example of how to use the visualization function
     print("\nTo visualize the reverse process, run:")
-    print("visualize_reverse_gol('best_model.pth', forward_steps=5, refine_steps=3)")
+    print("visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=5, refine_steps=3)")
     print("or")
-    print("visualize_reverse_gol('checkpoint_epoch_10.pth', forward_steps=5, refine_steps=3)")
+    print("visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps=5, refine_steps=3)")
 
 
 if __name__ == "__main__":
     # Check if we have a trained model to visualize
     import os
-    if os.path.exists('best_model.pth'):
+    os.makedirs('checkpoints', exist_ok=True)
+    forward_steps=15
+    refine_steps=3
+    if os.path.exists('checkpoints/best_model.pth'):
         print("Found best model, running visualization...")
-        visualize_reverse_gol('best_model.pth', forward_steps=5, refine_steps=3)
-    elif os.path.exists('checkpoint_epoch_10.pth'):
+        visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=forward_steps, refine_steps=refine_steps)
+    elif os.path.exists('checkpoints/checkpoint_epoch_10.pth'):
         print("Found epoch 10 checkpoint, running visualization...")
-        visualize_reverse_gol('checkpoint_epoch_10.pth', forward_steps=5, refine_steps=3)
+        visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps=forward_steps, refine_steps=refine_steps)
     else:
         print("No trained model found. Running training first...")
         main()
         print("\nTraining completed! Now running visualization...")
-        visualize_reverse_gol('best_model.pth', forward_steps=5, refine_steps=3)
+        visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=forward_steps, refine_steps=refine_steps)
