@@ -5,6 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 import random
 import os
+from datetime import datetime
 
 # -------------------------------
 # Game of Life forward simulator
@@ -115,11 +116,17 @@ class RefinementCNN(nn.Module):
         self.latent_dim = latent_dim
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, base, 3, padding=1),
+            nn.BatchNorm2d(base),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),  # Add dropout for regularization
             nn.Conv2d(base, base, 3, padding=1),
+            nn.BatchNorm2d(base),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),  # Add dropout for regularization
             nn.Conv2d(base, base, 3, padding=1),
+            nn.BatchNorm2d(base),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),  # Add dropout for regularization
             nn.Conv2d(base, 1 + latent_dim, 1)  # 1 for previous state + latent_dim for latent variables
         )
 
@@ -165,6 +172,7 @@ class RefinementCNN2(nn.Module):
             nn.Conv2d(base, base, 3, padding=1),
             nn.BatchNorm2d(base),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),  # Add dropout for regularization
             nn.Conv2d(base, base, 3, padding=1),
             nn.BatchNorm2d(base),
             nn.ReLU(inplace=True)
@@ -175,6 +183,7 @@ class RefinementCNN2(nn.Module):
             nn.Conv2d(base, base // 2, 3, padding=1),
             nn.BatchNorm2d(base // 2),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),  # Add dropout for regularization
             nn.Conv2d(base // 2, 1 + latent_dim, 1)  # 1 for previous state + latent_dim for latent variables
         )
         
@@ -341,7 +350,7 @@ def eval_metrics(model: nn.Module,
         - Fraction of samples where forward reconstruction exactly matches current
     """
     model.eval()
-    bce = nn.BCEWithLogitsLoss(reduction="sum")
+    bce = nn.BCEWithLogitsLoss()  # Use same reduction as training
 
     total_bce = 0.0
     total_pixels = 0
@@ -358,8 +367,10 @@ def eval_metrics(model: nn.Module,
         probs = torch.sigmoid(logits)
         pred_prev = (probs > 0.5).float()
 
-        # Supervised BCE loss
-        total_bce += bce(logits, prev).item()
+        # Supervised BCE loss - use same computation as training
+        # For consistency with training, we could also use deep supervision here
+        # But for validation, using final step only is reasonable
+        total_bce += bce(logits, prev).item() * curr.size(0)  # Multiply by batch size to match training
 
         # Bit accuracy on previous state (excluding trivial cases)
         # Create neighbor count mask for current state
@@ -578,8 +589,40 @@ def visualize_reverse_gol(checkpoint_path: str,
     
     return model, states_forward, reconstructed_states, ground_truth_states
 
-def create_model(base: int = 128, latent_dim: int = 8):
-    return RefinementCNN(base=base, latent_dim=latent_dim)
+def log_best_model_results(model: nn.Module, epoch: int, train_loss: float, val_bce: float, 
+                          val_bit_acc: float, val_recon_ok: float, 
+                          base: int = 128, latent_dim: int = 8,
+                          refine_steps: int = 3, grid_size: str = "64x64"):
+    """
+    Log the best model results to results.txt file.
+    
+    Args:
+        model: The trained model object
+        epoch: Training epoch number
+        train_loss: Training loss
+        val_bce: Validation BCE loss
+        val_bit_acc: Validation bit accuracy
+        val_recon_ok: Validation reconstruction accuracy
+        base: Base number of channels
+        latent_dim: Number of latent dimensions
+        refine_steps: Number of refinement steps
+        grid_size: Grid size as string (e.g., "64x64")
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Extract model name from the model object
+    model_name = model.__class__.__name__
+    
+    # Create results.txt if it doesn't exist and add header
+    if not os.path.exists('results.txt'):
+        with open('results.txt', 'w') as f:
+            f.write("Date,Time,Model_Name,Base_Channels,Latent_Dim,Grid_Size,Refine_Steps,Epoch,Train_Loss,Val_BCE,Val_Bit_Accuracy,Val_Recon_Accuracy\n")
+    
+    # Append the new best result
+    with open('results.txt', 'a') as f:
+        f.write(f"{timestamp.split()[0]},{timestamp.split()[1]},{model_name},{base},{latent_dim},{grid_size},{refine_steps},{epoch},{train_loss:.6f},{val_bce:.6f},{val_bit_acc:.6f},{val_recon_ok:.6f}\n")
+    
+    print(f"Logged best model results to results.txt: Epoch {epoch}, Bit Acc: {val_bit_acc:.4f}, Recon: {val_recon_ok:.4f}")
 
 # -------------------------------
 # Main
@@ -598,7 +641,8 @@ def train_model():
     val_dl = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=workers)
 
     model = create_model(base=128, latent_dim=8).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # Add weight decay for regularization
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
     refine_steps = 3
     epochs = 10
@@ -607,6 +651,8 @@ def train_model():
     best_bit_acc = 0.0
     best_recon_ok = 0.0
     best_epoch = 0
+    patience = 5  # Early stopping patience
+    no_improve_count = 0
 
     for epoch in range(1, epochs + 1):
         tr_loss = train_epoch(model, train_dl, opt, device, refine_steps, deep_supervision=True)
@@ -642,9 +688,30 @@ def train_model():
             }
             torch.save(best_checkpoint, 'checkpoints/best_model.pth')
             print(f"New best model saved! Bit accuracy: {bit_acc:.4f}")
+            no_improve_count = 0  # Reset counter when we find a better model
+        else:
+            no_improve_count += 1
+            if no_improve_count >= patience:
+                print(f"Early stopping at epoch {epoch} - no improvement for {patience} epochs")
+                break
 
     print(f"\nTraining completed!")
     print(f"Best model was from epoch {best_epoch} with bit accuracy: {best_bit_acc:.4f}")
+    
+    # Log the best model results to results.txt after training is complete
+    if best_epoch > 0:  # Only log if we found a best model
+        log_best_model_results(
+            model=model,
+            epoch=best_epoch,
+            train_loss=best_checkpoint['train_loss'],
+            val_bce=best_checkpoint['val_bce'],
+            val_bit_acc=best_checkpoint['val_bit_acc'],
+            val_recon_ok=best_checkpoint['val_recon_ok'],
+            base=128,
+            latent_dim=8,
+            refine_steps=refine_steps,
+            grid_size=f"{H}x{W}"
+        )
 
     # Show one sample check
     with torch.no_grad():
@@ -666,8 +733,12 @@ def train_model():
     print("visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps=5, refine_steps=3)")
 
 
+def create_model(base: int = 128, latent_dim: int = 8):
+    return RefinementCNN(base=base, latent_dim=latent_dim)
+
+
 if __name__ == "__main__":
-    train = False
+    train = True
     forward_steps=50
     refine_steps=3
     os.makedirs('checkpoints', exist_ok=True)

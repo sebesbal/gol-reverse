@@ -8,3 +8,4 @@ checkpoint_epoch_07.pth
 checkpoint_epoch_08.pth
 checkpoint_epoch_09.pth
 checkpoint_epoch_10.pth
+/checkpoints/*.pth

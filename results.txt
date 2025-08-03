@@ -1,0 +1,3 @@
+Date,Time,Model_Name,Base_Channels,Latent_Dim,Grid_Size,Refine_Steps,Epoch,Train_Loss,Val_BCE,Val_Bit_Accuracy,Val_Recon_Accuracy
+2025-08-03,15:36:33,RefinementCNN,128,8,64x64,3,9,0.082859,297.549192,0.921943,0.000000
+2025-08-03,15:54:22,RefinementCNN,128,8,64x64,3,10,0.080104,0.075019,0.922379,0.000000
