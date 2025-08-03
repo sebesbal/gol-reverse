@@ -39,18 +39,20 @@ def gol_step(x_bin: torch.Tensor) -> torch.Tensor:
     return next_state
 
 
-def dilate_3x3(mask_bin: torch.Tensor) -> torch.Tensor:
+def count_neighbors_3x3(mask_bin: torch.Tensor) -> torch.Tensor:
     """
-    Dilate a binary mask with a 3x3 neighborhood.
+    Count the number of mismatching neighbors in a 3x3 neighborhood for each cell.
 
     Args:
         mask_bin: Tensor [B, 1, H, W] in {0, 1}.
 
     Returns:
-        dilated mask of the same shape.
+        Tensor of same shape, where each value is the count of mismatching neighbors (0-9).
     """
-    return F.max_pool2d(mask_bin, kernel_size=3, stride=1, padding=1)
-
+    kernel = torch.ones((1, 1, 3, 3), dtype=mask_bin.dtype, device=mask_bin.device)
+    # Sum over 3x3 neighborhood (including center)
+    neighbor_count = F.conv2d(mask_bin, kernel, padding=1)
+    return neighbor_count
 
 # -------------------------------
 # Dataset
@@ -107,8 +109,9 @@ class RefinementCNN(nn.Module):
         latent variables for next iteration
     """
 
-    def __init__(self, in_ch: int = 7, base: int = 32, latent_dim: int = 4):
+    def __init__(self, base: int = 32, latent_dim: int = 4):
         super().__init__()
+        in_ch = latent_dim + 3
         self.latent_dim = latent_dim
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, base, 3, padding=1),
@@ -139,10 +142,11 @@ class RefinementCNN2(nn.Module):
         latent variables for next iteration
     """
 
-    def __init__(self, in_ch: int = 7, base: int = 128, latent_dim: int = 8):
+    def __init__(self, base: int = 128, latent_dim: int = 8):
         super().__init__()
         self.latent_dim = latent_dim
-        
+        in_ch = latent_dim + 3  # Always use this relationship
+
         # Initial feature extraction
         self.input_conv = nn.Sequential(
             nn.Conv2d(in_ch, base, 3, padding=1),
@@ -173,7 +177,7 @@ class RefinementCNN2(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(base // 2, 1 + latent_dim, 1)  # 1 for previous state + latent_dim for latent variables
         )
-
+        
     def _make_residual_block(self, in_channels, out_channels):
         """Create a residual block with batch normalization."""
         return nn.Sequential(
@@ -246,7 +250,7 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int) -> RefineOut
     pred_prev = current_bin
     next_from_pred = gol_step(pred_prev)
     mismatch = (next_from_pred != current_bin).float()
-    err = dilate_3x3(mismatch)
+    err = count_neighbors_3x3(mismatch)
     
     # Initialize latent variables
     latent = torch.zeros(current_bin.size(0), model.latent_dim, current_bin.size(2), current_bin.size(3), 
@@ -271,7 +275,7 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int) -> RefineOut
             # Forward check and error dilation
             next_from_pred = gol_step(pred_prev)
             mismatch = (next_from_pred != current_bin).float()
-            err = dilate_3x3(mismatch)
+            err = count_neighbors_3x3(mismatch)
 
             logits_hist.append(logits)
             probs_hist.append(probs)
@@ -423,7 +427,7 @@ def visualize_reverse_gol(checkpoint_path: str,
     
     # Load model
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = RefinementCNN2(in_ch=11, base=128, latent_dim=8).to(device)
+    model = create_model(base=128, latent_dim=8).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -574,6 +578,8 @@ def visualize_reverse_gol(checkpoint_path: str,
     
     return model, states_forward, reconstructed_states, ground_truth_states
 
+def create_model(base: int = 128, latent_dim: int = 8):
+    return RefinementCNN(base=base, latent_dim=latent_dim)
 
 # -------------------------------
 # Main
@@ -591,7 +597,7 @@ def train_model():
     train_dl = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=workers)
     val_dl = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=workers)
 
-    model = RefinementCNN2(in_ch=11, base=128, latent_dim=8).to(device)
+    model = create_model(base=128, latent_dim=8).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     refine_steps = 3
