@@ -8,6 +8,45 @@ import os
 from datetime import datetime
 
 # -------------------------------
+# Configuration
+# -------------------------------
+
+@dataclass
+class Config:
+    """Centralized configuration for all parameters."""
+    # Model parameters
+    base_channels: int = 128
+    latent_dim: int = 8
+    
+    # Training parameters
+    batch_size: int = 32
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    epochs: int = 10
+    patience: int = 5  # Early stopping patience
+    
+    # Dataset parameters
+    grid_size: int = 64
+    density: float = 0.15
+    warmup_steps: int = 10
+    train_samples: int = 8000
+    val_samples: int = 1000
+    
+    # Refinement parameters
+    refine_steps: int = 10
+    steps_training: int = 3  # Number of steps with gradients enabled during training
+    
+    # Visualization parameters
+    forward_steps: int = 50
+    seed: int = 42
+    
+    # DataLoader parameters
+    num_workers: int = 16
+
+# Global configuration instance
+config = Config()
+
+# -------------------------------
 # Game of Life forward simulator
 # -------------------------------
 
@@ -243,7 +282,41 @@ class RefineOutput:
     errmask_per_iter: list
 
 
-def refine(model: nn.Module, current_bin: torch.Tensor, steps: int) -> RefineOutput:
+def _refinement_step(model: nn.Module, current_bin: torch.Tensor, pred_prev: torch.Tensor, 
+                    err: torch.Tensor, latent: torch.Tensor) -> tuple:
+    """
+    Perform a single refinement step.
+    
+    Args:
+        model: The refinement model
+        current_bin: Current state tensor [B, 1, H, W]
+        pred_prev: Previous prediction tensor [B, 1, H, W]
+        err: Error mask tensor [B, 1, H, W]
+        latent: Latent variables tensor [B, latent_dim, H, W]
+        
+    Returns:
+        tuple: (logits, probs, pred_prev, err, latent) - updated values after one step
+    """
+    # Concatenate: current_bin (1) + pred_prev (1) + err (1) + latent (latent_dim)
+    inp = torch.cat([current_bin, pred_prev, err, latent], dim=1)
+    output = model(inp)
+    
+    # Split output into logits for previous state and latent variables
+    logits = output[:, :1]  # First channel for previous state
+    latent = output[:, 1:]  # Remaining channels for latent variables
+    
+    probs = torch.sigmoid(logits)
+    pred_prev = (probs > 0.5).float()
+
+    # Forward check and error dilation
+    next_from_pred = gol_step(pred_prev)
+    mismatch = (next_from_pred != current_bin).float()
+    err = count_neighbors_3x3(mismatch)
+    
+    return logits, probs, pred_prev, err, latent
+
+
+def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_training: int = None) -> RefineOutput:
     """
     Perform iterative prediction and error-driven refinement.
 
@@ -251,6 +324,7 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int) -> RefineOut
         model: RefinementCNN
         current_bin: Tensor [B, 1, H, W] in {0, 1}
         steps: number of refinement iterations
+        steps_training: number of steps with gradients enabled during training (if None, use all steps)
 
     Returns:
         RefineOutput with lists across iterations.
@@ -267,29 +341,46 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int) -> RefineOut
 
     logits_hist, probs_hist, bin_hist, err_hist = [], [], [], []
 
-    # Allow grads during training, disable in eval automatically
-    with torch.set_grad_enabled(model.training):
-        for _ in range(steps):
-            # Concatenate: current_bin (1) + pred_prev (1) + err (1) + latent (latent_dim)
-            inp = torch.cat([current_bin, pred_prev, err, latent], dim=1)
-            output = model(inp)
-            
-            # Split output into logits for previous state and latent variables
-            logits = output[:, :1]  # First channel for previous state
-            latent = output[:, 1:]  # Remaining channels for latent variables
-            
-            probs = torch.sigmoid(logits)
-            pred_prev = (probs > 0.5).float()
-
-            # Forward check and error dilation
-            next_from_pred = gol_step(pred_prev)
-            mismatch = (next_from_pred != current_bin).float()
-            err = count_neighbors_3x3(mismatch)
-
-            logits_hist.append(logits)
-            probs_hist.append(probs)
-            bin_hist.append(pred_prev)
-            err_hist.append(err)
+    # Determine gradient behavior based on training mode and steps_training parameter
+    if model.training and steps_training is not None:
+        # Training mode with specified steps_training
+        import random
+        max_no_grad = steps - steps_training
+        steps_no_grad = random.randint(0, max_no_grad) if max_no_grad > 0 else 0
+        steps_with_grad = steps - steps_no_grad
+        
+        # First do steps without gradients
+        for _ in range(steps_no_grad):
+            with torch.set_grad_enabled(False):
+                logits, probs, pred_prev, err, latent = _refinement_step(
+                    model, current_bin, pred_prev, err, latent
+                )
+                logits_hist.append(logits)
+                probs_hist.append(probs)
+                bin_hist.append(pred_prev)
+                err_hist.append(err)
+        
+        # Then do steps with gradients
+        for _ in range(steps_with_grad):
+            with torch.set_grad_enabled(True):
+                logits, probs, pred_prev, err, latent = _refinement_step(
+                    model, current_bin, pred_prev, err, latent
+                )
+                logits_hist.append(logits)
+                probs_hist.append(probs)
+                bin_hist.append(pred_prev)
+                err_hist.append(err)
+    else:
+        # Testing mode or training without steps_training specified - use all steps with model's training state
+        with torch.set_grad_enabled(model.training):
+            for _ in range(steps):
+                logits, probs, pred_prev, err, latent = _refinement_step(
+                    model, current_bin, pred_prev, err, latent
+                )
+                logits_hist.append(logits)
+                probs_hist.append(probs)
+                bin_hist.append(pred_prev)
+                err_hist.append(err)
 
     return RefineOutput(logits_hist, probs_hist, bin_hist, err_hist)
 
@@ -303,6 +394,7 @@ def train_epoch(model: nn.Module,
                 opt: torch.optim.Optimizer,
                 device: str,
                 refine_steps: int = 3,
+                steps_training: int = 1,
                 deep_supervision: bool = True) -> float:
     """
     Train for one epoch.
@@ -321,7 +413,7 @@ def train_epoch(model: nn.Module,
         prev = prev.to(device)  # [B, 1, H, W]
         opt.zero_grad()
 
-        out = refine(model, curr, refine_steps)
+        out = refine(model, curr, refine_steps, steps_training=steps_training)
         if deep_supervision:
             losses = [bce(logits, prev) for logits in out.logits_per_iter]
             loss = sum(losses) / len(losses)
@@ -410,25 +502,33 @@ def eval_metrics(model: nn.Module,
 # -------------------------------
 
 def visualize_reverse_gol(checkpoint_path: str, 
-                         H: int = 64, W: int = 64, 
-                         forward_steps: int = 5, 
-                         refine_steps: int = 3,
-                         density: float = 0.15,
-                         seed: int = 42):
+                         H: int = None, W: int = None, 
+                         forward_steps: int = None, 
+                         refine_steps: int = None,
+                         density: float = None,
+                         seed: int = None):
     """
     Visualize the reverse Game of Life process using a saved model.
     
     Args:
         checkpoint_path: Path to saved model checkpoint
-        H, W: Grid dimensions
-        forward_steps: Number of forward Game of Life steps to simulate
-        refine_steps: Number of refinement iterations for reverse process
-        density: Initial density for random state generation
-        seed: Random seed for reproducibility
+        H, W: Grid dimensions (uses config.grid_size if None)
+        forward_steps: Number of forward Game of Life steps to simulate (uses config.forward_steps if None)
+        refine_steps: Number of refinement iterations for reverse process (uses config.refine_steps if None)
+        density: Initial density for random state generation (uses config.density if None)
+        seed: Random seed for reproducibility (uses config.seed if None)
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
     from matplotlib.colors import ListedColormap
+    
+    # Use config values if parameters are None
+    H = H or config.grid_size
+    W = W or config.grid_size
+    forward_steps = forward_steps or config.forward_steps
+    refine_steps = refine_steps or config.refine_steps
+    density = density or config.density
+    seed = seed or config.seed
     
     # Set random seed
     random.seed(seed)
@@ -438,7 +538,7 @@ def visualize_reverse_gol(checkpoint_path: str,
     
     # Load model
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = create_model(base=128, latent_dim=8).to(device)
+    model = create_model(base=config.base_channels, latent_dim=config.latent_dim).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -630,33 +730,28 @@ def log_best_model_results(model: nn.Module, epoch: int, train_loss: float, val_
 
 def train_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    H, W = 64, 64
+    H, W = config.grid_size, config.grid_size
 
-    train_ds = GoLReverseDataset(n_samples=8000, H=H, W=W, density=0.15, warmup_steps=10, seed=1)
-    val_ds = GoLReverseDataset(n_samples=1000, H=H, W=W, density=0.15, warmup_steps=10, seed=2)
+    train_ds = GoLReverseDataset(n_samples=config.train_samples, H=H, W=W, 
+                                density=config.density, warmup_steps=config.warmup_steps, seed=1)
+    val_ds = GoLReverseDataset(n_samples=config.val_samples, H=H, W=W, 
+                              density=config.density, warmup_steps=config.warmup_steps, seed=2)
 
-    # Set num_workers=0 for portability across OSes
-    workers = 16
-    train_dl = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=workers)
-    val_dl = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=workers)
+    train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
 
-    model = create_model(base=128, latent_dim=8).to(device)
-    # Add weight decay for regularization
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-
-    refine_steps = 3
-    epochs = 10
+    model = create_model(base=config.base_channels, latent_dim=config.latent_dim).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     
     # Track best model
     best_bit_acc = 0.0
     best_recon_ok = 0.0
     best_epoch = 0
-    patience = 5  # Early stopping patience
     no_improve_count = 0
 
-    for epoch in range(1, epochs + 1):
-        tr_loss = train_epoch(model, train_dl, opt, device, refine_steps, deep_supervision=True)
-        val_bce, bit_acc, recon_ok = eval_metrics(model, val_dl, device, refine_steps)
+    for epoch in range(1, config.epochs + 1):
+        tr_loss = train_epoch(model, train_dl, opt, device, config.refine_steps, config.steps_training, deep_supervision=True)
+        val_bce, bit_acc, recon_ok = eval_metrics(model, val_dl, device, config.refine_steps)
         print(f"epoch {epoch:02d}  train_bce {tr_loss:.4f}  val_bce {val_bce:.4f}  bit_acc {bit_acc:.4f}  recon_ok {recon_ok:.4f}")
         
         # Save model checkpoint after each epoch
@@ -691,8 +786,8 @@ def train_model():
             no_improve_count = 0  # Reset counter when we find a better model
         else:
             no_improve_count += 1
-            if no_improve_count >= patience:
-                print(f"Early stopping at epoch {epoch} - no improvement for {patience} epochs")
+            if no_improve_count >= config.patience:
+                print(f"Early stopping at epoch {epoch} - no improvement for {config.patience} epochs")
                 break
 
     print(f"\nTraining completed!")
@@ -707,9 +802,9 @@ def train_model():
             val_bce=best_checkpoint['val_bce'],
             val_bit_acc=best_checkpoint['val_bit_acc'],
             val_recon_ok=best_checkpoint['val_recon_ok'],
-            base=128,
-            latent_dim=8,
-            refine_steps=refine_steps,
+            base=config.base_channels,
+            latent_dim=config.latent_dim,
+            refine_steps=config.refine_steps,
             grid_size=f"{H}x{W}"
         )
 
@@ -718,7 +813,7 @@ def train_model():
         curr, prev = val_ds[0]
         curr = curr.to(device).unsqueeze(0)
         prev = prev.to(device).unsqueeze(0)
-        out = refine(model, curr, steps=refine_steps)
+        out = refine(model, curr, steps=config.refine_steps)
         pred_prev = (torch.sigmoid(out.logits_per_iter[-1]) > 0.5).float()
         recon = gol_step(pred_prev)
         forward_ok = bool((recon == curr).all().item())
@@ -728,29 +823,30 @@ def train_model():
     
     # Example of how to use the visualization function
     print("\nTo visualize the reverse process, run:")
-    print("visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=5, refine_steps=3)")
+    print(f"visualize_reverse_gol('checkpoints/best_model.pth', forward_steps={config.forward_steps}, refine_steps={config.refine_steps})")
     print("or")
-    print("visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps=5, refine_steps=3)")
+    print(f"visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps={config.forward_steps}, refine_steps={config.refine_steps})")
 
 
-def create_model(base: int = 128, latent_dim: int = 8):
+def create_model(base: int = None, latent_dim: int = None):
+    """Create a model with the specified parameters or use config defaults."""
+    base = base or config.base_channels
+    latent_dim = latent_dim or config.latent_dim
     return RefinementCNN(base=base, latent_dim=latent_dim)
 
 
 if __name__ == "__main__":
-    train = True
-    forward_steps=50
-    refine_steps=3
+    train = False
     os.makedirs('checkpoints', exist_ok=True)
     if train:
         train_model()
         print("\nTraining completed! Now running visualization...")
-        visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=forward_steps, refine_steps=refine_steps)
+        visualize_reverse_gol('checkpoints/best_model.pth')
     else:
         if os.path.exists('checkpoints/best_model.pth'):
             print("Found best model, running visualization...")
-            visualize_reverse_gol('checkpoints/best_model.pth', forward_steps=forward_steps, refine_steps=refine_steps)
+            visualize_reverse_gol('checkpoints/best_model.pth')
         elif os.path.exists('checkpoints/checkpoint_epoch_10.pth'):
             print("Found epoch 10 checkpoint, running visualization...")
-            visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth', forward_steps=forward_steps, refine_steps=refine_steps)
+            visualize_reverse_gol('checkpoints/checkpoint_epoch_10.pth')
 
