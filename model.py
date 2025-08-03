@@ -41,6 +41,7 @@ class Config:
     # Refinement parameters
     refine_steps: int = 10
     steps_training: int = 3  # Number of steps with gradients enabled during training
+    deep_supervision: bool = False  # Whether to use deep supervision (requires history storage)
     
     # Visualization parameters
     forward_steps: int = 50

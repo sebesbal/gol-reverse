@@ -57,10 +57,13 @@ class GoLReverseDataset(Dataset):
 
 @dataclass
 class RefineOutput:
-    logits_per_iter: list
-    probs_per_iter: list
-    bin_per_iter: list
-    errmask_per_iter: list
+    logits_per_iter: list  # Only for deep supervision training
+    probs_per_iter: list   # Only for deep supervision training
+    bin_per_iter: list     # Only for deep supervision training
+    errmask_per_iter: list # Only for deep supervision training
+    final_logits: torch.Tensor = None  # For evaluation and non-deep supervision
+    final_probs: torch.Tensor = None   # For evaluation
+    final_pred: torch.Tensor = None    # For evaluation
 
 
 def _refinement_step(model: nn.Module, current_bin: torch.Tensor, pred_prev: torch.Tensor, 
@@ -97,7 +100,7 @@ def _refinement_step(model: nn.Module, current_bin: torch.Tensor, pred_prev: tor
     return logits, probs, pred_prev, err, latent
 
 
-def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_training: int = None) -> RefineOutput:
+def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_training: int = None, deep_supervision: bool = True) -> RefineOutput:
     """
     Perform iterative prediction and error-driven refinement.
 
@@ -106,6 +109,7 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_traini
         current_bin: Tensor [B, 1, H, W] in {0, 1}
         steps: number of refinement iterations
         steps_training: number of steps with gradients enabled during training (if None, use all steps)
+        deep_supervision: whether to store history for deep supervision
 
     Returns:
         RefineOutput with lists across iterations.
@@ -121,6 +125,7 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_traini
                         device=current_bin.device, dtype=current_bin.dtype)
 
     logits_hist, probs_hist, bin_hist, err_hist = [], [], [], []
+    final_logits, final_probs, final_pred = None, None, None
 
     # Determine gradient behavior based on training mode and steps_training parameter
     if model.training and steps_training is not None:
@@ -130,27 +135,34 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_traini
         steps_no_grad = random.randint(0, max_no_grad) if max_no_grad > 0 else 0
         steps_with_grad = steps - steps_no_grad
         
-        # First do steps without gradients
-        for _ in range(steps_no_grad):
-            with torch.set_grad_enabled(False):
+        model.eval()
+        with torch.inference_mode():
+            # First do steps without gradients
+            for _ in range(steps_no_grad):
                 logits, probs, pred_prev, err, latent = _refinement_step(
                     model, current_bin, pred_prev, err, latent
                 )
-                logits_hist.append(logits)
-                probs_hist.append(probs)
-                bin_hist.append(pred_prev)
-                err_hist.append(err)
+                # Don't store history for no-gradient steps - they can't be used for training!
+                # These tensors have requires_grad=False and can't be used in deep supervision
         
+        model.train()
         # Then do steps with gradients
         for _ in range(steps_with_grad):
             with torch.set_grad_enabled(True):
                 logits, probs, pred_prev, err, latent = _refinement_step(
                     model, current_bin, pred_prev, err, latent
                 )
-                logits_hist.append(logits)
-                probs_hist.append(probs)
-                bin_hist.append(pred_prev)
-                err_hist.append(err)
+                # Store history only if deep supervision is enabled
+                if deep_supervision:
+                    logits_hist.append(logits)
+                    probs_hist.append(probs)
+                    bin_hist.append(pred_prev)
+                    err_hist.append(err)
+        
+        # Store final values for evaluation
+        final_logits = logits
+        final_probs = probs
+        final_pred = pred_prev
     else:
         # Testing mode or training without steps_training specified - use all steps with model's training state
         with torch.set_grad_enabled(model.training):
@@ -158,12 +170,19 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_traini
                 logits, probs, pred_prev, err, latent = _refinement_step(
                     model, current_bin, pred_prev, err, latent
                 )
-                logits_hist.append(logits)
-                probs_hist.append(probs)
-                bin_hist.append(pred_prev)
-                err_hist.append(err)
+                # Store history only if deep supervision is enabled
+                if deep_supervision:
+                    logits_hist.append(logits)
+                    probs_hist.append(probs)
+                    bin_hist.append(pred_prev)
+                    err_hist.append(err)
+            
+            # Store final values for evaluation
+            final_logits = logits
+            final_probs = probs
+            final_pred = pred_prev
 
-    return RefineOutput(logits_hist, probs_hist, bin_hist, err_hist)
+    return RefineOutput(logits_hist, probs_hist, bin_hist, err_hist, final_logits, final_probs, final_pred)
 
 
 # -------------------------------
@@ -194,17 +213,22 @@ def train_epoch(model: nn.Module,
         prev = to_device(prev, device)  # [B, 1, H, W]
         opt.zero_grad()
 
-        out = refine(model, curr, refine_steps, steps_training=steps_training)
+        out = refine(model, curr, refine_steps, steps_training=steps_training, deep_supervision=deep_supervision)
         
-        if deep_supervision:
+        if deep_supervision and len(out.logits_per_iter) > 0:
             losses = []
             for logits in out.logits_per_iter:
                 # Calculate loss on all pixels, not just non-trivial ones
                 losses.append(bce(logits, prev))
             loss = sum(losses) / len(losses)
+        elif deep_supervision and len(out.logits_per_iter) == 0:
+            # Deep supervision enabled but no gradient steps were performed
+            # Fall back to final step only
+            loss = bce(out.final_logits, prev)
         else:
             # Calculate loss on all pixels, not just non-trivial ones
-            loss = bce(out.logits_per_iter[-1], prev)
+            # Use final logits directly instead of accessing list
+            loss = bce(out.final_logits, prev)
 
         loss.backward()
         opt.step()
@@ -243,9 +267,10 @@ def eval_metrics(model: nn.Module,
         prev = to_device(prev, device)
 
         out = refine(model, curr, refine_steps)
-        logits = out.logits_per_iter[-1]
-        probs = torch.sigmoid(logits)
-        pred_prev = (probs > 0.5).float()
+        # Use final values directly instead of accessing list
+        logits = out.final_logits
+        probs = out.final_probs
+        pred_prev = out.final_pred
 
         # Get non-trivial mask for current state
         non_trivial_mask = get_non_trivial_mask(curr, device)
@@ -342,7 +367,7 @@ def train_model():
     no_improve_count = 0
 
     for epoch in range(1, config.epochs + 1):
-        tr_loss = train_epoch(model, train_dl, opt, device, config.refine_steps, config.steps_training, deep_supervision=True)
+        tr_loss = train_epoch(model, train_dl, opt, device, config.refine_steps, config.steps_training, deep_supervision=config.deep_supervision)
         val_bce, bit_acc, recon_ok = eval_metrics(model, val_dl, device, config.refine_steps)
         print(f"epoch {epoch:02d}  train_bce {tr_loss:.4f}  val_bce {val_bce:.4f}  bit_acc {bit_acc:.4f}  recon_ok {recon_ok:.4f}")
         
@@ -406,7 +431,7 @@ def train_model():
         curr = to_device(curr, device).unsqueeze(0)
         prev = to_device(prev, device).unsqueeze(0)
         out = refine(model, curr, steps=config.refine_steps)
-        pred_prev = (torch.sigmoid(out.logits_per_iter[-1]) > 0.5).float()
+        pred_prev = out.final_pred
         recon = gol_step(pred_prev)
         forward_ok = bool((recon == curr).all().item())
         
