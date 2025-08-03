@@ -38,6 +38,7 @@ class Config:
     
     # Visualization parameters
     forward_steps: int = 50
+    reverse_steps: int = 5  # Number of CA steps to go backwards
     seed: int = 42
     
     # DataLoader parameters
@@ -400,7 +401,7 @@ def train_epoch(model: nn.Module,
     Train for one epoch.
 
     Loss:
-        BCEWithLogitsLoss toward the true previous state.
+        BCEWithLogitsLoss toward the true previous state (excluding trivial cases).
         If deep_supervision is True, average loss across all refinement steps.
     """
     model.train()
@@ -414,16 +415,51 @@ def train_epoch(model: nn.Module,
         opt.zero_grad()
 
         out = refine(model, curr, refine_steps, steps_training=steps_training)
+        
+        # Create neighbor count mask for current state to identify non-trivial cases
+        kernel = torch.tensor(
+            [[1, 1, 1],
+             [1, 1, 1],
+             [1, 1, 1]],
+            dtype=curr.dtype,
+            device=device
+        ).view(1, 1, 3, 3)
+        
+        neighbor_counts = F.conv2d(curr, kernel, padding=1)
+        non_trivial_mask = neighbor_counts > 0
+        
         if deep_supervision:
-            losses = [bce(logits, prev) for logits in out.logits_per_iter]
+            losses = []
+            for logits in out.logits_per_iter:
+                if non_trivial_mask.sum() > 0:
+                    # Apply mask to logits and prev for BCE calculation
+                    masked_logits = logits[non_trivial_mask]
+                    masked_prev = prev[non_trivial_mask]
+                    if masked_logits.numel() > 0:
+                        losses.append(bce(masked_logits, masked_prev))
+                    else:
+                        losses.append(torch.tensor(0.0, device=device))
+                else:
+                    losses.append(torch.tensor(0.0, device=device))
             loss = sum(losses) / len(losses)
         else:
-            loss = bce(out.logits_per_iter[-1], prev)
+            if non_trivial_mask.sum() > 0:
+                # Apply mask to logits and prev for BCE calculation
+                masked_logits = out.logits_per_iter[-1][non_trivial_mask]
+                masked_prev = prev[non_trivial_mask]
+                if masked_logits.numel() > 0:
+                    loss = bce(masked_logits, masked_prev)
+                else:
+                    loss = torch.tensor(0.0, device=device)
+            else:
+                loss = torch.tensor(0.0, device=device)
 
         loss.backward()
         opt.step()
 
-        batch_size = curr.size(0)
+        # Count non-trivial samples for loss averaging
+        sample_has_nontrivial = non_trivial_mask.view(curr.size(0), -1).any(dim=1)
+        batch_size = sample_has_nontrivial.sum().item()
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
@@ -437,14 +473,15 @@ def eval_metrics(model: nn.Module,
                  refine_steps: int = 3):
     """
     Evaluate:
-        - Average BCE loss
-        - Bit accuracy on previous state (excluding trivial cases with no neighbors)
-        - Fraction of samples where forward reconstruction exactly matches current
+        - Average BCE loss (excluding trivial cases)
+        - Bit accuracy on previous state (excluding trivial cases)
+        - Fraction of samples where forward reconstruction exactly matches current (excluding trivial cases)
     """
     model.eval()
     bce = nn.BCEWithLogitsLoss()  # Use same reduction as training
 
     total_bce = 0.0
+    total_bce_samples = 0
     total_pixels = 0
     correct_prev_bits = 0
     recon_exact_count = 0
@@ -459,16 +496,10 @@ def eval_metrics(model: nn.Module,
         probs = torch.sigmoid(logits)
         pred_prev = (probs > 0.5).float()
 
-        # Supervised BCE loss - use same computation as training
-        # For consistency with training, we could also use deep supervision here
-        # But for validation, using final step only is reasonable
-        total_bce += bce(logits, prev).item() * curr.size(0)  # Multiply by batch size to match training
-
-        # Bit accuracy on previous state (excluding trivial cases)
         # Create neighbor count mask for current state
         kernel = torch.tensor(
             [[1, 1, 1],
-             [1, 0, 1],
+             [1, 1, 1],
              [1, 1, 1]],
             dtype=curr.dtype,
             device=device
@@ -478,20 +509,35 @@ def eval_metrics(model: nn.Module,
         # Mask for non-trivial cases (where there are neighbors)
         non_trivial_mask = neighbor_counts > 0
         
+        # Create mask for non-trivial predictions (current state has neighbors AND predicted prev is not empty)
+        non_trivial_pred_mask = non_trivial_mask & (pred_prev > 0.5)
+        
+        # BCE loss only for non-trivial cases
+        if non_trivial_mask.sum() > 0:
+            # Apply mask to logits and prev for BCE calculation
+            masked_logits = logits[non_trivial_mask]
+            masked_prev = prev[non_trivial_mask]
+            if masked_logits.numel() > 0:
+                total_bce += bce(masked_logits, masked_prev).item() * masked_logits.numel()
+                total_bce_samples += masked_logits.numel()
+
+        # Bit accuracy on previous state (excluding trivial cases)
         # Only count accuracy for non-trivial cases
         if non_trivial_mask.sum() > 0:
             correct_prev_bits += ((pred_prev == prev) & non_trivial_mask).sum().item()
             total_pixels += non_trivial_mask.sum().item()
 
-        # Exact forward reconstruction check per sample
-        recon = gol_step(pred_prev)
-        # Compare per-sample equality
-        batch_equal = (recon == curr).view(recon.size(0), -1).all(dim=1)
-        recon_exact_count += batch_equal.sum().item()
+        # Exact forward reconstruction check per sample (excluding trivial cases)
+        # Only count samples that have non-trivial cases
+        sample_has_nontrivial = non_trivial_mask.view(curr.size(0), -1).any(dim=1)
+        if sample_has_nontrivial.sum() > 0:
+            recon = gol_step(pred_prev)
+            # Compare per-sample equality only for non-trivial samples
+            batch_equal = (recon == curr).view(recon.size(0), -1).all(dim=1)
+            recon_exact_count += (batch_equal & sample_has_nontrivial).sum().item()
+            total_samples += sample_has_nontrivial.sum().item()
 
-        total_samples += curr.size(0)
-
-    avg_bce = total_bce / max(1, total_samples)
+    avg_bce = total_bce / max(1, total_bce_samples)
     bit_acc = correct_prev_bits / max(1, total_pixels)
     recon_ok_ratio = recon_exact_count / max(1, total_samples)
     return avg_bce, bit_acc, recon_ok_ratio
@@ -562,26 +608,63 @@ def visualize_reverse_gol(checkpoint_path: str,
     
     final_state = states_forward[-1]
     
-    # Reverse reconstruction
-    print(f"\nReverse reconstruction ({refine_steps} refinement steps):")
-    out = refine(model, final_state.unsqueeze(0).to(device), refine_steps)
+    # Reverse reconstruction - multiple CA steps backwards
+    print(f"\nReverse reconstruction ({config.reverse_steps} CA steps backwards):")
     reconstructed_states = []
+    current_state = final_state
     
-    for i, pred_prev in enumerate(out.bin_per_iter):
-        reconstructed_states.append(pred_prev.squeeze(0))
-        print(f"  Refinement {i+1}: {pred_prev.sum().item():.0f} live cells")
+    for step in range(config.reverse_steps):
+        # Use refine() to get the previous state (one CA step backwards)
+        out = refine(model, current_state.unsqueeze(0).to(device), refine_steps)
+        # Take the final prediction from the refinement process
+        prev_state = (torch.sigmoid(out.logits_per_iter[-1]) > 0.5).float().squeeze(0)
+        reconstructed_states.append(prev_state)
+        print(f"  Reverse step {step+1}: {prev_state.sum().item():.0f} live cells")
+        current_state = prev_state
     
-    # Prepare ground truth states (reverse of forward simulation)
-    ground_truth_states = list(reversed(states_forward[:-1]))  # Exclude final state
-    
-    # Create visualization with only 2 rows (ground truth and model reconstruction)
-    # Show only refine_steps + 1 columns (input state + refinement steps)
-    n_steps = refine_steps + 1
+    # Create visualization showing multiple reverse CA steps
+    n_steps = config.reverse_steps + 1
     fig, axes = plt.subplots(2, n_steps, figsize=(15, 6))
+    # Compute accuracy for this specific experiment (excluding trivial cases)
+    experiment_accuracy = 0.0
+    if len(reconstructed_states) > 0:
+        total_acc = 0.0
+        valid_steps = 0
+        for i, recon_state in enumerate(reconstructed_states):
+            gt_idx = len(states_forward) - 2 - i  # Corresponding ground truth
+            if gt_idx >= 0:
+                gt_state = states_forward[gt_idx].to(device)
+                
+                                # Create neighbor count mask for current state to identify non-trivial cases
+                kernel = torch.tensor(
+                    [[1, 1, 1],
+                     [1, 1, 1],
+                     [1, 1, 1]],
+                    dtype=final_state.dtype,
+                    device=device
+                ).view(1, 1, 3, 3)
+                
+                # Use the state that was input to this reverse step
+                if i == 0:
+                    input_state = final_state.to(device)
+                else:
+                    input_state = reconstructed_states[i-1].to(device)
+                
+                neighbor_counts = F.conv2d(input_state.unsqueeze(0), kernel, padding=1).squeeze()
+                non_trivial_mask = neighbor_counts > 0
+                
+                if non_trivial_mask.sum() > 0:
+                    # Calculate accuracy only for non-trivial cases
+                    correct_pixels = ((recon_state > 0.5) == (gt_state > 0.5)) & non_trivial_mask
+                    acc = correct_pixels.float().sum().item() / non_trivial_mask.sum().item()
+                    total_acc += acc
+                    valid_steps += 1
+        if valid_steps > 0:
+            experiment_accuracy = total_acc / valid_steps
+    
     fig.suptitle(f'Game of Life Reverse Process Visualization\n'
                  f'Model: Epoch {checkpoint["epoch"]}, '
-                 f'Bit Acc: {checkpoint["val_bit_acc"]:.3f}, '
-                 f'Recon: {checkpoint["val_recon_ok"]:.3f}', fontsize=14)
+                 f'Experiment Accuracy: {experiment_accuracy:.3f}', fontsize=14)
     
     # Custom colormap: white (dead), black (alive), red (difference)
     colors = ['white', 'black', 'red']
@@ -590,47 +673,51 @@ def visualize_reverse_gol(checkpoint_path: str,
     # Column headers
     for i in range(n_steps):
         if i == 0:
-            axes[0, i].set_title('Input State', fontweight='bold', fontsize=10)
+            axes[0, i].set_title('Final State', fontweight='bold', fontsize=10)
         else:
-            axes[0, i].set_title(f'Refinement {i}', fontweight='bold', fontsize=10)
+            axes[0, i].set_title(f'Reverse Step {i}', fontweight='bold', fontsize=10)
     
     # Row labels
-    axes[0, 0].text(-0.3, 0.5, 'Ground Truth\n(Reverse)', transform=axes[0, 0].transAxes, 
+    axes[0, 0].text(-0.3, 0.5, 'Ground Truth', transform=axes[0, 0].transAxes, 
                      ha='center', va='center', fontweight='bold', fontsize=12, rotation=90)
-    axes[1, 0].text(-0.3, 0.5, 'Model\nReconstruction', transform=axes[1, 0].transAxes, 
+    axes[1, 0].text(-0.3, 0.5, 'Model\nPrediction', transform=axes[1, 0].transAxes, 
                      ha='center', va='center', fontweight='bold', fontsize=12, rotation=90)
     
-    # Row 1: Ground truth (reverse of forward simulation)
-    # First column: input state (final state from forward simulation)
+    # Row 1: Ground truth (forward simulation states in reverse order)
+    # First column: final state from forward simulation
     axes[0, 0].imshow(final_state.squeeze().cpu(), cmap='gray', vmin=0, vmax=1)
     axes[0, 0].axis('off')
-    axes[0, 0].text(0.5, -0.1, f'{final_state.sum().item():.0f} cells (input)', 
+    axes[0, 0].text(0.5, -0.1, f'{final_state.sum().item():.0f} cells', 
                     ha='center', transform=axes[0, 0].transAxes, fontsize=8)
     
-    # Subsequent columns: ground truth reverse states (show only up to refine_steps)
-    for i in range(min(len(ground_truth_states), refine_steps)):
-        state = ground_truth_states[i]
-        axes[0, i+1].imshow(state.squeeze().cpu(), cmap='gray', vmin=0, vmax=1)
-        axes[0, i+1].axis('off')
-        axes[0, i+1].text(0.5, -0.1, f'{state.sum().item():.0f} cells', 
-                        ha='center', transform=axes[0, i+1].transAxes, fontsize=8)
+    # Subsequent columns: ground truth states going backwards
+    for i in range(config.reverse_steps):
+        gt_idx = len(states_forward) - 2 - i  # Go backwards from final state
+        if gt_idx >= 0:
+            gt_state = states_forward[gt_idx]
+            axes[0, i+1].imshow(gt_state.squeeze().cpu(), cmap='gray', vmin=0, vmax=1)
+            axes[0, i+1].axis('off')
+            axes[0, i+1].text(0.5, -0.1, f'{gt_state.sum().item():.0f} cells', 
+                            ha='center', transform=axes[0, i+1].transAxes, fontsize=8)
+        else:
+            axes[0, i+1].axis('off')
+            axes[0, i+1].text(0.5, 0.5, 'N/A', ha='center', va='center', transform=axes[0, i+1].transAxes)
     
-    # Hide unused subplots in first row
-    for i in range(min(len(ground_truth_states), refine_steps) + 1, n_steps):
-        axes[0, i].axis('off')
-    
-    # Row 2: Model reconstruction
-    # First column: input state (same as ground truth)
+    # Row 2: Model predictions
+    # First column: final state (same as ground truth)
     axes[1, 0].imshow(final_state.squeeze().cpu(), cmap='gray', vmin=0, vmax=1)
     axes[1, 0].axis('off')
-    axes[1, 0].text(0.5, -0.1, f'{final_state.sum().item():.0f} cells (input)', 
+    axes[1, 0].text(0.5, -0.1, f'{final_state.sum().item():.0f} cells', 
                     ha='center', transform=axes[1, 0].transAxes, fontsize=8)
     
-    # Subsequent columns: model reconstruction iterations (show only up to refine_steps)
-    for i in range(min(len(reconstructed_states), refine_steps)):
+    # Subsequent columns: model predictions for each reverse step
+    for i in range(len(reconstructed_states)):
         recon_state = reconstructed_states[i]
-        if i < len(ground_truth_states):
-            gt_state = ground_truth_states[i].to(device)
+        gt_idx = len(states_forward) - 2 - i  # Corresponding ground truth
+        
+        if gt_idx >= 0:
+            gt_state = states_forward[gt_idx].to(device)
+            
             # 0 = no difference, 1 = model alive but GT dead, 2 = model dead but GT alive
             diff_mask = torch.zeros_like(recon_state)
             diff_mask = torch.where((recon_state > 0.5) & (gt_state < 0.5), 
@@ -645,18 +732,29 @@ def visualize_reverse_gol(checkpoint_path: str,
             axes[1, i+1].imshow(vis_state.squeeze().cpu(), cmap=cmap, vmin=0, vmax=2)
             axes[1, i+1].axis('off')
             
-            # Calculate accuracy
-            accuracy = ((recon_state > 0.5) == (gt_state > 0.5)).float().mean().item()
+            # Calculate accuracy (excluding trivial cases)
+            # Use the state that was input to this reverse step
+            if i == 0:
+                input_state = final_state.to(device)
+            else:
+                input_state = reconstructed_states[i-1].to(device)
+            
+            neighbor_counts = F.conv2d(input_state.unsqueeze(0), kernel, padding=1).squeeze()
+            non_trivial_mask = neighbor_counts > 0
+            
+            if non_trivial_mask.sum() > 0:
+                correct_pixels = ((recon_state > 0.5) == (gt_state > 0.5)) & non_trivial_mask
+                accuracy = correct_pixels.float().sum().item() / non_trivial_mask.sum().item()
+            else:
+                accuracy = 0.0
             axes[1, i+1].text(0.5, -0.1, f'{recon_state.sum().item():.0f} cells\n{accuracy:.3f} acc', 
                             ha='center', transform=axes[1, i+1].transAxes, fontsize=8)
         else:
-            axes[1, i+1].imshow(recon_state.squeeze().cpu(), cmap='gray', vmin=0, vmax=1)
             axes[1, i+1].axis('off')
-            axes[1, i+1].text(0.5, -0.1, f'{recon_state.sum().item():.0f} cells', 
-                            ha='center', transform=axes[1, i+1].transAxes, fontsize=8)
+            axes[1, i+1].text(0.5, 0.5, 'N/A', ha='center', va='center', transform=axes[1, i+1].transAxes)
     
-    # Hide unused subplots in second row
-    for i in range(min(len(reconstructed_states), refine_steps) + 1, n_steps):
+    # Hide unused subplots
+    for i in range(len(reconstructed_states) + 1, n_steps):
         axes[1, i].axis('off')
     
     # Add legend for difference visualization
@@ -675,19 +773,45 @@ def visualize_reverse_gol(checkpoint_path: str,
     print(f"Initial state: {initial_state.sum().item():.0f} live cells")
     print(f"Final state: {final_state.sum().item():.0f} live cells")
     
-    if len(reconstructed_states) > 0 and len(ground_truth_states) > 0:
-        final_recon = reconstructed_states[-1]
-        final_gt = ground_truth_states[0].to(device)  # First step in reverse
-        final_accuracy = ((final_recon > 0.5) == (final_gt > 0.5)).float().mean().item()
-        print(f"Final reconstruction accuracy: {final_accuracy:.4f}")
+    if len(reconstructed_states) > 0:
+        # Calculate accuracy for each reverse step
+        total_accuracy = 0.0
+        valid_steps = 0
         
-        # Check if forward reconstruction matches
-        recon_forward = gol_step(final_recon.unsqueeze(0)).squeeze(0)
-        # Move both tensors to the same device for comparison
+        for i, recon_state in enumerate(reconstructed_states):
+            gt_idx = len(states_forward) - 2 - i  # Corresponding ground truth
+            if gt_idx >= 0:
+                gt_state = states_forward[gt_idx].to(device)
+                
+                # Use the state that was input to this reverse step
+                if i == 0:
+                    input_state = final_state.to(device)
+                else:
+                    input_state = reconstructed_states[i-1].to(device)
+                
+                neighbor_counts = F.conv2d(input_state.unsqueeze(0), kernel, padding=1).squeeze()
+                non_trivial_mask = neighbor_counts > 0
+                
+                if non_trivial_mask.sum() > 0:
+                    correct_pixels = ((recon_state > 0.5) == (gt_state > 0.5)) & non_trivial_mask
+                    accuracy = correct_pixels.float().sum().item() / non_trivial_mask.sum().item()
+                    total_accuracy += accuracy
+                    valid_steps += 1
+                    print(f"Reverse step {i+1} accuracy: {accuracy:.4f}")
+                else:
+                    print(f"Reverse step {i+1}: No non-trivial cases")
+        
+        if valid_steps > 0:
+            avg_accuracy = total_accuracy / valid_steps
+            print(f"Average reverse accuracy: {avg_accuracy:.4f}")
+        
+        # Check if forward reconstruction matches for the first reverse step
+        first_recon = reconstructed_states[0]
+        recon_forward = gol_step(first_recon.unsqueeze(0)).squeeze(0)
         forward_match = torch.allclose(recon_forward.to(device), final_state.to(device), atol=1e-6)
         print(f"Forward reconstruction matches: {forward_match}")
     
-    return model, states_forward, reconstructed_states, ground_truth_states
+    return model, states_forward, reconstructed_states
 
 def log_best_model_results(model: nn.Module, epoch: int, train_loss: float, val_bce: float, 
                           val_bit_acc: float, val_recon_ok: float, 
@@ -817,9 +941,26 @@ def train_model():
         pred_prev = (torch.sigmoid(out.logits_per_iter[-1]) > 0.5).float()
         recon = gol_step(pred_prev)
         forward_ok = bool((recon == curr).all().item())
-        prev_bit_acc = float((pred_prev == prev).float().mean().item())
+        
+        # Calculate bit accuracy excluding trivial cases
+        kernel = torch.tensor(
+            [[1, 1, 1],
+             [1, 1, 1],
+             [1, 1, 1]],
+            dtype=curr.dtype,
+            device=device
+        ).view(1, 1, 3, 3)
+        
+        neighbor_counts = F.conv2d(curr, kernel, padding=1)
+        non_trivial_mask = neighbor_counts > 0
+        
+        if non_trivial_mask.sum() > 0:
+            prev_bit_acc = float(((pred_prev == prev) & non_trivial_mask).float().sum().item() / non_trivial_mask.sum().item())
+        else:
+            prev_bit_acc = 0.0
+            
         print("forward check ok:", forward_ok)
-        print("prev bit accuracy:", prev_bit_acc)
+        print("prev bit accuracy (non-trivial):", prev_bit_acc)
     
     # Example of how to use the visualization function
     print("\nTo visualize the reverse process, run:")
