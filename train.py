@@ -135,29 +135,27 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_traini
         steps_no_grad = random.randint(0, max_no_grad) if max_no_grad > 0 else 0
         steps_with_grad = steps - steps_no_grad
         
-        model.eval()
-        with torch.inference_mode():
-            # First do steps without gradients
-            for _ in range(steps_no_grad):
-                logits, probs, pred_prev, err, latent = _refinement_step(
-                    model, current_bin, pred_prev, err, latent
-                )
-                # Don't store history for no-gradient steps - they can't be used for training!
-                # These tensors have requires_grad=False and can't be used in deep supervision
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            with torch.no_grad():
+                # First do steps without gradients
+                for _ in range(steps_no_grad):
+                    logits, probs, pred_prev, err, latent = _refinement_step(
+                        model, current_bin, pred_prev, err, latent
+                    )
+                    # Don't store history for no-gradient steps - they can't be used for training!
+                    # These tensors have requires_grad=False and can't be used in deep supervision
         
-        model.train()
         # Then do steps with gradients
         for _ in range(steps_with_grad):
-            with torch.set_grad_enabled(True):
-                logits, probs, pred_prev, err, latent = _refinement_step(
-                    model, current_bin, pred_prev, err, latent
-                )
-                # Store history only if deep supervision is enabled
-                if deep_supervision:
-                    logits_hist.append(logits)
-                    probs_hist.append(probs)
-                    bin_hist.append(pred_prev)
-                    err_hist.append(err)
+            logits, probs, pred_prev, err, latent = _refinement_step(
+                model, current_bin, pred_prev, err, latent
+            )
+            # Store history only if deep supervision is enabled
+            if deep_supervision:
+                logits_hist.append(logits)
+                probs_hist.append(probs)
+                bin_hist.append(pred_prev)
+                err_hist.append(err)
         
         # Store final values for evaluation
         final_logits = logits
@@ -165,7 +163,7 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_traini
         final_pred = pred_prev
     else:
         # Testing mode or training without steps_training specified - use all steps with model's training state
-        with torch.set_grad_enabled(model.training):
+        with torch.no_grad():
             for _ in range(steps):
                 logits, probs, pred_prev, err, latent = _refinement_step(
                     model, current_bin, pred_prev, err, latent
