@@ -100,13 +100,16 @@ class RefinementCNN(nn.Module):
         c0 = current state
         c1 = previous prediction (initially zeros)
         c2 = error mask (initially zeros)
+        c3-c6 = latent variables (initially zeros)
 
     Output:
         logits for the previous state (before sigmoid)
+        latent variables for next iteration
     """
 
-    def __init__(self, in_ch: int = 3, base: int = 32):
+    def __init__(self, in_ch: int = 7, base: int = 32, latent_dim: int = 4):
         super().__init__()
+        self.latent_dim = latent_dim
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, base, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -114,11 +117,105 @@ class RefinementCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(base, base, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(base, 1, 1)
+            nn.Conv2d(base, 1 + latent_dim, 1)  # 1 for previous state + latent_dim for latent variables
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class RefinementCNN2(nn.Module):
+    """
+    Larger model with residual connections, batch normalization, and more capacity.
+    
+    Input channels:
+        c0 = current state
+        c1 = previous prediction (initially zeros)
+        c2 = error mask (initially zeros)
+        c3-c6 = latent variables (initially zeros)
+
+    Output:
+        logits for the previous state (before sigmoid)
+        latent variables for next iteration
+    """
+
+    def __init__(self, in_ch: int = 7, base: int = 128, latent_dim: int = 8):
+        super().__init__()
+        self.latent_dim = latent_dim
+        
+        # Initial feature extraction
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(in_ch, base, 3, padding=1),
+            nn.BatchNorm2d(base),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Residual blocks
+        self.res_block1 = self._make_residual_block(base, base)
+        self.res_block2 = self._make_residual_block(base, base)
+        self.res_block3 = self._make_residual_block(base, base)
+        self.res_block4 = self._make_residual_block(base, base)
+        
+        # Additional processing layers
+        self.mid_conv = nn.Sequential(
+            nn.Conv2d(base, base, 3, padding=1),
+            nn.BatchNorm2d(base),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base, base, 3, padding=1),
+            nn.BatchNorm2d(base),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Final output layers
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(base, base // 2, 3, padding=1),
+            nn.BatchNorm2d(base // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base // 2, 1 + latent_dim, 1)  # 1 for previous state + latent_dim for latent variables
+        )
+
+    def _make_residual_block(self, in_channels, out_channels):
+        """Create a residual block with batch normalization."""
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Initial feature extraction
+        out = self.input_conv(x)
+        
+        # Residual blocks with skip connections
+        residual = out
+        out = self.res_block1(out)
+        out = out + residual  # Skip connection
+        out = F.relu(out)
+        
+        residual = out
+        out = self.res_block2(out)
+        out = out + residual  # Skip connection
+        out = F.relu(out)
+        
+        residual = out
+        out = self.res_block3(out)
+        out = out + residual  # Skip connection
+        out = F.relu(out)
+        
+        residual = out
+        out = self.res_block4(out)
+        out = out + residual  # Skip connection
+        out = F.relu(out)
+        
+        # Additional processing
+        out = self.mid_conv(out)
+        
+        # Final output
+        out = self.output_conv(out)
+        
+        return out
 
 
 # -------------------------------
@@ -150,14 +247,24 @@ def refine(model: nn.Module, current_bin: torch.Tensor, steps: int) -> RefineOut
     next_from_pred = gol_step(pred_prev)
     mismatch = (next_from_pred != current_bin).float()
     err = dilate_3x3(mismatch)
+    
+    # Initialize latent variables
+    latent = torch.zeros(current_bin.size(0), model.latent_dim, current_bin.size(2), current_bin.size(3), 
+                        device=current_bin.device, dtype=current_bin.dtype)
 
     logits_hist, probs_hist, bin_hist, err_hist = [], [], [], []
 
     # Allow grads during training, disable in eval automatically
     with torch.set_grad_enabled(model.training):
         for _ in range(steps):
-            inp = torch.cat([current_bin, pred_prev, err], dim=1)
-            logits = model(inp)
+            # Concatenate: current_bin (1) + pred_prev (1) + err (1) + latent (latent_dim)
+            inp = torch.cat([current_bin, pred_prev, err, latent], dim=1)
+            output = model(inp)
+            
+            # Split output into logits for previous state and latent variables
+            logits = output[:, :1]  # First channel for previous state
+            latent = output[:, 1:]  # Remaining channels for latent variables
+            
             probs = torch.sigmoid(logits)
             pred_prev = (probs > 0.5).float()
 
@@ -316,7 +423,7 @@ def visualize_reverse_gol(checkpoint_path: str,
     
     # Load model
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = RefinementCNN(in_ch=3, base=48).to(device)
+    model = RefinementCNN2(in_ch=11, base=128, latent_dim=8).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -484,7 +591,7 @@ def train_model():
     train_dl = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=workers)
     val_dl = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=workers)
 
-    model = RefinementCNN(in_ch=3, base=48).to(device)
+    model = RefinementCNN2(in_ch=11, base=128, latent_dim=8).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     refine_steps = 3
@@ -554,8 +661,8 @@ def train_model():
 
 
 if __name__ == "__main__":
-    train = True
-    forward_steps=15
+    train = False
+    forward_steps=50
     refine_steps=3
     os.makedirs('checkpoints', exist_ok=True)
     if train:
