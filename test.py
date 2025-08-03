@@ -9,7 +9,8 @@ from matplotlib.colors import ListedColormap
 
 from model import (
     config, gol_step, count_neighbors_3x3, get_non_trivial_mask,
-    calculate_accuracy_excluding_trivial, create_model
+    calculate_accuracy_excluding_trivial, create_model, get_device,
+    setup_seed, get_checkpoint_path, to_device
 )
 from train import refine
 
@@ -25,14 +26,13 @@ def visualize_reverse_gol(checkpoint_path: str):
         checkpoint_path: Path to saved model checkpoint
     """
     # Set random seed
-    random.seed(config.seed)
-    torch.manual_seed(config.seed)
+    setup_seed()
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_device()
     
     # Load model
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = create_model(base=config.base_channels, latent_dim=config.latent_dim, model_type=config.model_type).to(device)
+    model = create_model(base=config.base_channels, latent_dim=config.latent_dim, model_type=config.model_type, device=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -63,7 +63,7 @@ def visualize_reverse_gol(checkpoint_path: str):
     
     for step in range(config.reverse_steps):
         # Use refine() to get the previous state (one CA step backwards)
-        out = refine(model, current_state.unsqueeze(0).to(device), config.refine_steps)
+        out = refine(model, to_device(current_state.unsqueeze(0), device), config.refine_steps)
         # Take the final prediction from the refinement process
         prev_state = (torch.sigmoid(out.logits_per_iter[-1]) > 0.5).float().squeeze(0)
         reconstructed_states.append(prev_state)
@@ -81,13 +81,13 @@ def visualize_reverse_gol(checkpoint_path: str):
         for i, recon_state in enumerate(reconstructed_states):
             gt_idx = len(states_forward) - 2 - i  # Corresponding ground truth
             if gt_idx >= 0:
-                gt_state = states_forward[gt_idx].to(device)
+                gt_state = to_device(states_forward[gt_idx], device)
                 
                 # Use the state that was input to this reverse step
                 if i == 0:
-                    input_state = final_state.to(device)
+                    input_state = to_device(final_state, device)
                 else:
-                    input_state = reconstructed_states[i-1].to(device)
+                    input_state = to_device(reconstructed_states[i-1], device)
                 
                 # Calculate accuracy excluding trivial cases
                 acc, non_trivial_mask = calculate_accuracy_excluding_trivial(
@@ -153,7 +153,7 @@ def visualize_reverse_gol(checkpoint_path: str):
         gt_idx = len(states_forward) - 2 - i  # Corresponding ground truth
         
         if gt_idx >= 0:
-            gt_state = states_forward[gt_idx].to(device)
+            gt_state = to_device(states_forward[gt_idx], device)
             
             # 0 = no difference, 2 = extra (model alive but GT dead), 3 = missing (model dead but GT alive)
             diff_mask = torch.zeros_like(recon_state)
@@ -183,9 +183,9 @@ def visualize_reverse_gol(checkpoint_path: str):
             # Calculate accuracy (excluding trivial cases)
             # Use the state that was input to this reverse step
             if i == 0:
-                input_state = final_state.to(device)
+                input_state = to_device(final_state, device)
             else:
-                input_state = reconstructed_states[i-1].to(device)
+                input_state = to_device(reconstructed_states[i-1], device)
             
             accuracy, non_trivial_mask = calculate_accuracy_excluding_trivial(
                 recon_state, gt_state, input_state, device
@@ -239,13 +239,13 @@ def visualize_reverse_gol(checkpoint_path: str):
         for i, recon_state in enumerate(reconstructed_states):
             gt_idx = len(states_forward) - 2 - i  # Corresponding ground truth
             if gt_idx >= 0:
-                gt_state = states_forward[gt_idx].to(device)
+                gt_state = to_device(states_forward[gt_idx], device)
                 
                 # Use the state that was input to this reverse step
                 if i == 0:
-                    input_state = final_state.to(device)
+                    input_state = to_device(final_state, device)
                 else:
-                    input_state = reconstructed_states[i-1].to(device)
+                    input_state = to_device(reconstructed_states[i-1], device)
                 
                 accuracy, non_trivial_mask = calculate_accuracy_excluding_trivial(
                     recon_state, gt_state, input_state, device
@@ -264,7 +264,7 @@ def visualize_reverse_gol(checkpoint_path: str):
         # Check if forward reconstruction matches for the first reverse step
         first_recon = reconstructed_states[0]
         recon_forward = gol_step(first_recon.unsqueeze(0)).squeeze(0)
-        forward_match = torch.allclose(recon_forward.to(device), final_state.to(device), atol=1e-6)
+        forward_match = torch.allclose(to_device(recon_forward, device), to_device(final_state, device), atol=1e-6)
         print(f"Forward reconstruction matches: {forward_match}")
     
     return model, states_forward, reconstructed_states
@@ -272,7 +272,7 @@ def visualize_reverse_gol(checkpoint_path: str):
 
 if __name__ == "__main__":
     # Check if checkpoint exists
-    checkpoint_path = 'checkpoints/best_model.pth'
+    checkpoint_path = get_checkpoint_path()
     if not os.path.exists(checkpoint_path):
         print(f"Checkpoint not found: {checkpoint_path}")
         print("Available checkpoints:")

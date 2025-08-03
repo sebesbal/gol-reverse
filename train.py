@@ -9,7 +9,8 @@ from datetime import datetime
 
 from model import (
     config, gol_step, count_neighbors_3x3, get_non_trivial_mask,
-    create_model
+    create_model, get_device, setup_seed, ensure_checkpoint_dir,
+    get_checkpoint_path, checkpoint_exists, to_device
 )
 
 # -------------------------------
@@ -32,7 +33,7 @@ class GoLReverseDataset(Dataset):
         self.density = density
         self.warmup_steps = warmup_steps
         self.seed = seed
-        random.seed(seed)
+        setup_seed(seed)
 
     def __len__(self):
         return self.n
@@ -189,8 +190,8 @@ def train_epoch(model: nn.Module,
     total_samples = 0
 
     for curr, prev in loader:
-        curr = curr.to(device)
-        prev = prev.to(device)  # [B, 1, H, W]
+        curr = to_device(curr, device)
+        prev = to_device(prev, device)  # [B, 1, H, W]
         opt.zero_grad()
 
         out = refine(model, curr, refine_steps, steps_training=steps_training)
@@ -238,8 +239,8 @@ def eval_metrics(model: nn.Module,
     total_samples = 0
 
     for curr, prev in loader:
-        curr = curr.to(device)
-        prev = prev.to(device)
+        curr = to_device(curr, device)
+        prev = to_device(prev, device)
 
         out = refine(model, curr, refine_steps)
         logits = out.logits_per_iter[-1]
@@ -320,7 +321,7 @@ def log_best_model_results(model: nn.Module, epoch: int, train_loss: float, val_
 
 
 def train_model():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_device()
     H, W = config.grid_size, config.grid_size
 
     train_ds = GoLReverseDataset(n_samples=config.train_samples, H=H, W=W, 
@@ -331,7 +332,7 @@ def train_model():
     train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
     val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
 
-    model = create_model(base=config.base_channels, latent_dim=config.latent_dim, model_type=config.model_type).to(device)
+    model = create_model(base=config.base_channels, latent_dim=config.latent_dim, model_type=config.model_type, device=device)
     opt = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     
     # Track best model
@@ -355,7 +356,7 @@ def train_model():
             'val_bit_acc': bit_acc,
             'val_recon_ok': recon_ok
         }
-        torch.save(checkpoint, f'checkpoints/checkpoint_epoch_{epoch:02d}.pth')
+        torch.save(checkpoint, get_checkpoint_path(epoch))
         print(f"Saved checkpoint for epoch {epoch}")
         
         # Save best model based on bit accuracy
@@ -372,7 +373,7 @@ def train_model():
                 'val_recon_ok': recon_ok,
                 'best_bit_acc': best_bit_acc
             }
-            torch.save(best_checkpoint, 'checkpoints/best_model.pth')
+            torch.save(best_checkpoint, get_checkpoint_path())
             print(f"New best model saved! Bit accuracy: {bit_acc:.4f}")
             no_improve_count = 0  # Reset counter when we find a better model
         else:
@@ -402,8 +403,8 @@ def train_model():
     # Show one sample check
     with torch.no_grad():
         curr, prev = val_ds[0]
-        curr = curr.to(device).unsqueeze(0)
-        prev = prev.to(device).unsqueeze(0)
+        curr = to_device(curr, device).unsqueeze(0)
+        prev = to_device(prev, device).unsqueeze(0)
         out = refine(model, curr, steps=config.refine_steps)
         pred_prev = (torch.sigmoid(out.logits_per_iter[-1]) > 0.5).float()
         recon = gol_step(pred_prev)
@@ -422,9 +423,9 @@ def train_model():
     
     # Example of how to use the visualization function
     print("\nTo visualize the reverse process, run:")
-    print(f"python test.py --checkpoint checkpoints/best_model.pth")
+    print(f"python test.py --checkpoint {get_checkpoint_path()}")
 
 
 if __name__ == "__main__":
-    os.makedirs('checkpoints', exist_ok=True)
+    ensure_checkpoint_dir()
     train_model() 

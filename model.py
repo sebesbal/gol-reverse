@@ -2,6 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+import os
+
+# -------------------------------
+# Constants and Paths
+# -------------------------------
+
+CHECKPOINT_DIR = "checkpoints"
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+CHECKPOINT_TEMPLATE = os.path.join(CHECKPOINT_DIR, "checkpoint_epoch_{:02d}.pth")
 
 # -------------------------------
 # Configuration
@@ -43,6 +52,42 @@ class Config:
 
 # Global configuration instance
 config = Config()
+
+# -------------------------------
+# Utility Functions
+# -------------------------------
+
+def get_device():
+    """Get the appropriate device (CUDA if available, else CPU)."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+def setup_seed(seed=None):
+    """Set up random seeds for reproducibility."""
+    if seed is None:
+        seed = config.seed
+    import random
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+def ensure_checkpoint_dir():
+    """Ensure the checkpoint directory exists."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+def get_checkpoint_path(epoch=None):
+    """Get checkpoint path for a specific epoch or best model."""
+    if epoch is None:
+        return BEST_MODEL_PATH
+    return CHECKPOINT_TEMPLATE.format(epoch)
+
+def checkpoint_exists(epoch=None):
+    """Check if a checkpoint exists."""
+    return os.path.exists(get_checkpoint_path(epoch))
+
+def to_device(tensor, device=None):
+    """Move tensor to device with fallback to default device."""
+    if device is None:
+        device = get_device()
+    return tensor.to(device)
 
 # -------------------------------
 # Helper functions
@@ -262,15 +307,19 @@ class RefinementCNN2(nn.Module):
         return out
 
 
-def create_model(base: int = None, latent_dim: int = None, model_type: str = None):
+def create_model(base: int = None, latent_dim: int = None, model_type: str = None, device: str = None):
     """Create a model with the specified parameters or use config defaults."""
     base = base or config.base_channels
     latent_dim = latent_dim or config.latent_dim
     model_type = model_type or config.model_type
     
     if model_type == "RefinementCNN":
-        return RefinementCNN(base=base, latent_dim=latent_dim)
+        model = RefinementCNN(base=base, latent_dim=latent_dim)
     elif model_type == "RefinementCNN2":
-        return RefinementCNN2(base=base, latent_dim=latent_dim)
+        model = RefinementCNN2(base=base, latent_dim=latent_dim)
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Available options: RefinementCNN, RefinementCNN2") 
+        raise ValueError(f"Unknown model type: {model_type}. Available options: RefinementCNN, RefinementCNN2")
+    
+    if device is not None:
+        model = model.to(device)
+    return model 
