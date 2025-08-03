@@ -10,7 +10,7 @@ from datetime import datetime
 from model import (
     config, gol_step, count_neighbors_3x3, get_non_trivial_mask,
     create_model, get_device, setup_seed, ensure_checkpoint_dir,
-    get_checkpoint_path, checkpoint_exists, to_device
+    get_checkpoint_path, checkpoint_exists, to_device, print_progress_bar
 )
 
 # -------------------------------
@@ -208,7 +208,11 @@ def train_epoch(model: nn.Module,
     total_loss = 0.0
     total_samples = 0
 
-    for curr, prev in loader:
+    # Add progress bar for training
+    total_batches = len(loader)
+    print_progress_bar(0, total_batches, prefix='Training:', suffix='Complete', length=50)
+
+    for batch_idx, (curr, prev) in enumerate(loader):
         curr = to_device(curr, device)
         prev = to_device(prev, device)  # [B, 1, H, W]
         opt.zero_grad()
@@ -238,6 +242,10 @@ def train_epoch(model: nn.Module,
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
+        # Update progress bar
+        print_progress_bar(batch_idx + 1, total_batches, prefix='Training:', 
+                          suffix=f'Loss: {loss.item():.4f}', length=50)
+
     return total_loss / max(1, total_samples)
 
 
@@ -262,7 +270,11 @@ def eval_metrics(model: nn.Module,
     recon_exact_count = 0
     total_samples = 0
 
-    for curr, prev in loader:
+    # Add progress bar for evaluation
+    total_batches = len(loader)
+    print_progress_bar(0, total_batches, prefix='Evaluating:', suffix='Complete', length=50)
+
+    for batch_idx, (curr, prev) in enumerate(loader):
         curr = to_device(curr, device)
         prev = to_device(prev, device)
 
@@ -302,6 +314,10 @@ def eval_metrics(model: nn.Module,
             batch_equal = (recon == curr).view(recon.size(0), -1).all(dim=1)
             recon_exact_count += (batch_equal & sample_has_nontrivial).sum().item()
             total_samples += sample_has_nontrivial.sum().item()
+
+        # Update progress bar
+        print_progress_bar(batch_idx + 1, total_batches, prefix='Evaluating:', 
+                          suffix=f'BCE: {total_bce/max(1,total_bce_samples):.4f}', length=50)
 
     avg_bce = total_bce / max(1, total_bce_samples)
     bit_acc = correct_prev_bits / max(1, total_pixels)
@@ -366,10 +382,24 @@ def train_model():
     best_epoch = 0
     no_improve_count = 0
 
+    print(f"Starting training for {config.epochs} epochs...")
+    print_progress_bar(0, config.epochs, prefix='Overall Progress:', suffix='Complete', length=50)
+    
     for epoch in range(1, config.epochs + 1):
+        print(f"\nEpoch {epoch}/{config.epochs}")
+        print("=" * 50)
+        
         tr_loss = train_epoch(model, train_dl, opt, device, config.refine_steps, config.steps_training, deep_supervision=config.deep_supervision)
         val_bce, bit_acc, recon_ok = eval_metrics(model, val_dl, device, config.refine_steps)
-        print(f"epoch {epoch:02d}  train_bce {tr_loss:.4f}  val_bce {val_bce:.4f}  bit_acc {bit_acc:.4f}  recon_ok {recon_ok:.4f}")
+        print(f"\nEpoch {epoch:02d} Results:")
+        print(f"  Train BCE: {tr_loss:.4f}")
+        print(f"  Val BCE:   {val_bce:.4f}")
+        print(f"  Bit Acc:   {bit_acc:.4f}")
+        print(f"  Recon OK:  {recon_ok:.4f}")
+        
+        # Update overall progress bar
+        print_progress_bar(epoch, config.epochs, prefix='Overall Progress:', 
+                          suffix=f'Best Acc: {best_bit_acc:.4f}', length=50)
         
         # Save model checkpoint after each epoch
         checkpoint = {
