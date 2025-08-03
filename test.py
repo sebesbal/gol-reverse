@@ -32,7 +32,7 @@ def visualize_reverse_gol(checkpoint_path: str):
     
     # Load model
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = create_model(base=config.base_channels, latent_dim=config.latent_dim).to(device)
+    model = create_model(base=config.base_channels, latent_dim=config.latent_dim, model_type=config.model_type).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     

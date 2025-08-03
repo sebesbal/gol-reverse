@@ -1,0 +1,430 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from dataclasses import dataclass
+import random
+import os
+from datetime import datetime
+
+from model import (
+    config, gol_step, count_neighbors_3x3, get_non_trivial_mask,
+    create_model
+)
+
+# -------------------------------
+# Dataset
+# -------------------------------
+
+class GoLReverseDataset(Dataset):
+    """
+    Each sample is made as:
+        prev_state ~ Bernoulli(density)
+        current_state = gol_step(prev_state)
+
+    __getitem__ returns (current_state, prev_state) as float tensors in {0, 1}.
+    """
+
+    def __init__(self, n_samples: int, H: int, W: int, density: float = 0.15, warmup_steps: int = 0, seed: int = 0):
+        self.n = n_samples
+        self.H = H
+        self.W = W
+        self.density = density
+        self.warmup_steps = warmup_steps
+        self.seed = seed
+        random.seed(seed)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        # Start from random binary field
+        prev = torch.rand(1, self.H, self.W)
+        prev = (prev < self.density).float()
+
+        # Optional warmup steps to create more natural patterns
+        for _ in range(self.warmup_steps):
+            prev = gol_step(prev.unsqueeze(0)).squeeze(0)
+
+        curr = gol_step(prev.unsqueeze(0)).squeeze(0)
+        return curr, prev
+
+
+# -------------------------------
+# Iterative refinement loop
+# -------------------------------
+
+@dataclass
+class RefineOutput:
+    logits_per_iter: list
+    probs_per_iter: list
+    bin_per_iter: list
+    errmask_per_iter: list
+
+
+def _refinement_step(model: nn.Module, current_bin: torch.Tensor, pred_prev: torch.Tensor, 
+                    err: torch.Tensor, latent: torch.Tensor) -> tuple:
+    """
+    Perform a single refinement step.
+    
+    Args:
+        model: The refinement model
+        current_bin: Current state tensor [B, 1, H, W]
+        pred_prev: Previous prediction tensor [B, 1, H, W]
+        err: Error mask tensor [B, 1, H, W]
+        latent: Latent variables tensor [B, latent_dim, H, W]
+        
+    Returns:
+        tuple: (logits, probs, pred_prev, err, latent) - updated values after one step
+    """
+    # Concatenate: current_bin (1) + pred_prev (1) + err (1) + latent (latent_dim)
+    inp = torch.cat([current_bin, pred_prev, err, latent], dim=1)
+    output = model(inp)
+    
+    # Split output into logits for previous state and latent variables
+    logits = output[:, :1]  # First channel for previous state
+    latent = output[:, 1:]  # Remaining channels for latent variables
+    
+    probs = torch.sigmoid(logits)
+    pred_prev = (probs > 0.5).float()
+
+    # Forward check and error dilation
+    next_from_pred = gol_step(pred_prev)
+    mismatch = (next_from_pred != current_bin).float()
+    err = count_neighbors_3x3(mismatch)
+    
+    return logits, probs, pred_prev, err, latent
+
+
+def refine(model: nn.Module, current_bin: torch.Tensor, steps: int, steps_training: int = None) -> RefineOutput:
+    """
+    Perform iterative prediction and error-driven refinement.
+
+    Args:
+        model: RefinementCNN
+        current_bin: Tensor [B, 1, H, W] in {0, 1}
+        steps: number of refinement iterations
+        steps_training: number of steps with gradients enabled during training (if None, use all steps)
+
+    Returns:
+        RefineOutput with lists across iterations.
+    """
+    assert current_bin.dim() == 4 and current_bin.size(1) == 1, f"expected [B,1,H,W], got {tuple(current_bin.shape)}"
+    pred_prev = current_bin
+    next_from_pred = gol_step(pred_prev)
+    mismatch = (next_from_pred != current_bin).float()
+    err = count_neighbors_3x3(mismatch)
+    
+    # Initialize latent variables
+    latent = torch.zeros(current_bin.size(0), model.latent_dim, current_bin.size(2), current_bin.size(3), 
+                        device=current_bin.device, dtype=current_bin.dtype)
+
+    logits_hist, probs_hist, bin_hist, err_hist = [], [], [], []
+
+    # Determine gradient behavior based on training mode and steps_training parameter
+    if model.training and steps_training is not None:
+        # Training mode with specified steps_training
+        import random
+        max_no_grad = steps - steps_training
+        steps_no_grad = random.randint(0, max_no_grad) if max_no_grad > 0 else 0
+        steps_with_grad = steps - steps_no_grad
+        
+        # First do steps without gradients
+        for _ in range(steps_no_grad):
+            with torch.set_grad_enabled(False):
+                logits, probs, pred_prev, err, latent = _refinement_step(
+                    model, current_bin, pred_prev, err, latent
+                )
+                logits_hist.append(logits)
+                probs_hist.append(probs)
+                bin_hist.append(pred_prev)
+                err_hist.append(err)
+        
+        # Then do steps with gradients
+        for _ in range(steps_with_grad):
+            with torch.set_grad_enabled(True):
+                logits, probs, pred_prev, err, latent = _refinement_step(
+                    model, current_bin, pred_prev, err, latent
+                )
+                logits_hist.append(logits)
+                probs_hist.append(probs)
+                bin_hist.append(pred_prev)
+                err_hist.append(err)
+    else:
+        # Testing mode or training without steps_training specified - use all steps with model's training state
+        with torch.set_grad_enabled(model.training):
+            for _ in range(steps):
+                logits, probs, pred_prev, err, latent = _refinement_step(
+                    model, current_bin, pred_prev, err, latent
+                )
+                logits_hist.append(logits)
+                probs_hist.append(probs)
+                bin_hist.append(pred_prev)
+                err_hist.append(err)
+
+    return RefineOutput(logits_hist, probs_hist, bin_hist, err_hist)
+
+
+# -------------------------------
+# Training and evaluation
+# -------------------------------
+
+def train_epoch(model: nn.Module,
+                loader: DataLoader,
+                opt: torch.optim.Optimizer,
+                device: str,
+                refine_steps: int = 3,
+                steps_training: int = 1,
+                deep_supervision: bool = True) -> float:
+    """
+    Train for one epoch.
+
+    Loss:
+        BCEWithLogitsLoss toward the true previous state.
+        If deep_supervision is True, average loss across all refinement steps.
+    """
+    model.train()
+    bce = nn.BCEWithLogitsLoss()
+    total_loss = 0.0
+    total_samples = 0
+
+    for curr, prev in loader:
+        curr = curr.to(device)
+        prev = prev.to(device)  # [B, 1, H, W]
+        opt.zero_grad()
+
+        out = refine(model, curr, refine_steps, steps_training=steps_training)
+        
+        if deep_supervision:
+            losses = []
+            for logits in out.logits_per_iter:
+                # Calculate loss on all pixels, not just non-trivial ones
+                losses.append(bce(logits, prev))
+            loss = sum(losses) / len(losses)
+        else:
+            # Calculate loss on all pixels, not just non-trivial ones
+            loss = bce(out.logits_per_iter[-1], prev)
+
+        loss.backward()
+        opt.step()
+
+        # Count all samples for loss averaging
+        batch_size = curr.size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+    return total_loss / max(1, total_samples)
+
+
+@torch.no_grad()
+def eval_metrics(model: nn.Module,
+                 loader: DataLoader,
+                 device: str,
+                 refine_steps: int = 3):
+    """
+    Evaluate metrics (using non-trivial masks for evaluation):
+        - Average BCE loss (excluding trivial cases)
+        - Bit accuracy on previous state (excluding trivial cases)
+        - Fraction of samples where forward reconstruction exactly matches current (excluding trivial cases)
+    """
+    model.eval()
+    bce = nn.BCEWithLogitsLoss()  # Use same reduction as training
+
+    total_bce = 0.0
+    total_bce_samples = 0
+    total_pixels = 0
+    correct_prev_bits = 0
+    recon_exact_count = 0
+    total_samples = 0
+
+    for curr, prev in loader:
+        curr = curr.to(device)
+        prev = prev.to(device)
+
+        out = refine(model, curr, refine_steps)
+        logits = out.logits_per_iter[-1]
+        probs = torch.sigmoid(logits)
+        pred_prev = (probs > 0.5).float()
+
+        # Get non-trivial mask for current state
+        non_trivial_mask = get_non_trivial_mask(curr, device)
+        
+        # Create mask for non-trivial predictions (current state has neighbors AND predicted prev is not empty)
+        non_trivial_pred_mask = non_trivial_mask & (pred_prev > 0.5)
+        
+        # BCE loss only for non-trivial cases
+        if non_trivial_mask.sum() > 0:
+            # Apply mask to logits and prev for BCE calculation
+            masked_logits = logits[non_trivial_mask]
+            masked_prev = prev[non_trivial_mask]
+            if masked_logits.numel() > 0:
+                total_bce += bce(masked_logits, masked_prev).item() * masked_logits.numel()
+                total_bce_samples += masked_logits.numel()
+
+        # Bit accuracy on previous state (excluding trivial cases)
+        # Only count accuracy for non-trivial cases
+        if non_trivial_mask.sum() > 0:
+            correct_prev_bits += ((pred_prev == prev) & non_trivial_mask).sum().item()
+            total_pixels += non_trivial_mask.sum().item()
+
+        # Exact forward reconstruction check per sample (excluding trivial cases)
+        # Only count samples that have non-trivial cases
+        sample_has_nontrivial = non_trivial_mask.view(curr.size(0), -1).any(dim=1)
+        if sample_has_nontrivial.sum() > 0:
+            recon = gol_step(pred_prev)
+            # Compare per-sample equality only for non-trivial samples
+            batch_equal = (recon == curr).view(recon.size(0), -1).all(dim=1)
+            recon_exact_count += (batch_equal & sample_has_nontrivial).sum().item()
+            total_samples += sample_has_nontrivial.sum().item()
+
+    avg_bce = total_bce / max(1, total_bce_samples)
+    bit_acc = correct_prev_bits / max(1, total_pixels)
+    recon_ok_ratio = recon_exact_count / max(1, total_samples)
+    return avg_bce, bit_acc, recon_ok_ratio
+
+
+def log_best_model_results(model: nn.Module, epoch: int, train_loss: float, val_bce: float, 
+                          val_bit_acc: float, val_recon_ok: float, 
+                          base: int = 128, latent_dim: int = 8,
+                          refine_steps: int = 3, grid_size: str = "64x64"):
+    """
+    Log the best model results to results.txt file.
+    
+    Args:
+        model: The trained model object
+        epoch: Training epoch number
+        train_loss: Training loss
+        val_bce: Validation BCE loss
+        val_bit_acc: Validation bit accuracy
+        val_recon_ok: Validation reconstruction accuracy
+        base: Base number of channels
+        latent_dim: Number of latent dimensions
+        refine_steps: Number of refinement steps
+        grid_size: Grid size as string (e.g., "64x64")
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Extract model name from the model object
+    model_name = model.__class__.__name__
+    
+    # Create results.txt if it doesn't exist and add header
+    if not os.path.exists('results.txt'):
+        with open('results.txt', 'w') as f:
+            f.write("Date,Time,Model_Name,Base_Channels,Latent_Dim,Grid_Size,Refine_Steps,Epoch,Train_Loss,Val_BCE,Val_Bit_Accuracy,Val_Recon_Accuracy\n")
+    
+    # Append the new best result
+    with open('results.txt', 'a') as f:
+        f.write(f"{timestamp.split()[0]},{timestamp.split()[1]},{model_name},{base},{latent_dim},{grid_size},{refine_steps},{epoch},{train_loss:.6f},{val_bce:.6f},{val_bit_acc:.6f},{val_recon_ok:.6f}\n")
+    
+    print(f"Logged best model results to results.txt: Epoch {epoch}, Bit Acc: {val_bit_acc:.4f}, Recon: {val_recon_ok:.4f}")
+
+
+def train_model():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    H, W = config.grid_size, config.grid_size
+
+    train_ds = GoLReverseDataset(n_samples=config.train_samples, H=H, W=W, 
+                                density=config.density, warmup_steps=config.warmup_steps, seed=1)
+    val_ds = GoLReverseDataset(n_samples=config.val_samples, H=H, W=W, 
+                              density=config.density, warmup_steps=config.warmup_steps, seed=2)
+
+    train_dl = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
+
+    model = create_model(base=config.base_channels, latent_dim=config.latent_dim, model_type=config.model_type).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    
+    # Track best model
+    best_bit_acc = 0.0
+    best_recon_ok = 0.0
+    best_epoch = 0
+    no_improve_count = 0
+
+    for epoch in range(1, config.epochs + 1):
+        tr_loss = train_epoch(model, train_dl, opt, device, config.refine_steps, config.steps_training, deep_supervision=True)
+        val_bce, bit_acc, recon_ok = eval_metrics(model, val_dl, device, config.refine_steps)
+        print(f"epoch {epoch:02d}  train_bce {tr_loss:.4f}  val_bce {val_bce:.4f}  bit_acc {bit_acc:.4f}  recon_ok {recon_ok:.4f}")
+        
+        # Save model checkpoint after each epoch
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'train_loss': tr_loss,
+            'val_bce': val_bce,
+            'val_bit_acc': bit_acc,
+            'val_recon_ok': recon_ok
+        }
+        torch.save(checkpoint, f'checkpoints/checkpoint_epoch_{epoch:02d}.pth')
+        print(f"Saved checkpoint for epoch {epoch}")
+        
+        # Save best model based on bit accuracy
+        if bit_acc > best_bit_acc:
+            best_bit_acc = bit_acc
+            best_epoch = epoch
+            best_checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': opt.state_dict(),
+                'train_loss': tr_loss,
+                'val_bce': val_bce,
+                'val_bit_acc': bit_acc,
+                'val_recon_ok': recon_ok,
+                'best_bit_acc': best_bit_acc
+            }
+            torch.save(best_checkpoint, 'checkpoints/best_model.pth')
+            print(f"New best model saved! Bit accuracy: {bit_acc:.4f}")
+            no_improve_count = 0  # Reset counter when we find a better model
+        else:
+            no_improve_count += 1
+            if no_improve_count >= config.patience:
+                print(f"Early stopping at epoch {epoch} - no improvement for {config.patience} epochs")
+                break
+
+    print(f"\nTraining completed!")
+    print(f"Best model was from epoch {best_epoch} with bit accuracy: {best_bit_acc:.4f}")
+    
+    # Log the best model results to results.txt after training is complete
+    if best_epoch > 0:  # Only log if we found a best model
+        log_best_model_results(
+            model=model,
+            epoch=best_epoch,
+            train_loss=best_checkpoint['train_loss'],
+            val_bce=best_checkpoint['val_bce'],
+            val_bit_acc=best_checkpoint['val_bit_acc'],
+            val_recon_ok=best_checkpoint['val_recon_ok'],
+            base=config.base_channels,
+            latent_dim=config.latent_dim,
+            refine_steps=config.refine_steps,
+            grid_size=f"{H}x{W}"
+        )
+
+    # Show one sample check
+    with torch.no_grad():
+        curr, prev = val_ds[0]
+        curr = curr.to(device).unsqueeze(0)
+        prev = prev.to(device).unsqueeze(0)
+        out = refine(model, curr, steps=config.refine_steps)
+        pred_prev = (torch.sigmoid(out.logits_per_iter[-1]) > 0.5).float()
+        recon = gol_step(pred_prev)
+        forward_ok = bool((recon == curr).all().item())
+        
+        # Calculate bit accuracy excluding trivial cases
+        non_trivial_mask = get_non_trivial_mask(curr, device)
+        
+        if non_trivial_mask.sum() > 0:
+            prev_bit_acc = float(((pred_prev == prev) & non_trivial_mask).float().sum().item() / non_trivial_mask.sum().item())
+        else:
+            prev_bit_acc = 0.0
+            
+        print("forward check ok:", forward_ok)
+        print("prev bit accuracy (non-trivial):", prev_bit_acc)
+    
+    # Example of how to use the visualization function
+    print("\nTo visualize the reverse process, run:")
+    print(f"python test.py --checkpoint checkpoints/best_model.pth")
+
+
+if __name__ == "__main__":
+    os.makedirs('checkpoints', exist_ok=True)
+    train_model() 
