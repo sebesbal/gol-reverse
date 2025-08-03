@@ -103,8 +103,8 @@ def visualize_reverse_gol(checkpoint_path: str):
                  f'Model: Epoch {checkpoint["epoch"]}, '
                  f'Experiment Accuracy: {experiment_accuracy:.3f}', fontsize=14)
     
-    # Custom colormap: white (dead), black (alive), red (difference)
-    colors = ['white', 'black', 'red']
+    # Custom colormap: black (dead), white (alive), red (extra), blue (missing)
+    colors = ['black', 'white', 'red', 'blue']
     cmap = ListedColormap(colors)
     
     # Column headers
@@ -155,18 +155,29 @@ def visualize_reverse_gol(checkpoint_path: str):
         if gt_idx >= 0:
             gt_state = states_forward[gt_idx].to(device)
             
-            # 0 = no difference, 1 = model alive but GT dead, 2 = model dead but GT alive
+            # 0 = no difference, 2 = extra (model alive but GT dead), 3 = missing (model dead but GT alive)
             diff_mask = torch.zeros_like(recon_state)
             diff_mask = torch.where((recon_state > 0.5) & (gt_state < 0.5), 
-                                  torch.ones_like(diff_mask), diff_mask)  # Model alive, GT dead
+                                  torch.full_like(diff_mask, 2), diff_mask)  # Extra cells
             diff_mask = torch.where((recon_state < 0.5) & (gt_state > 0.5), 
-                                  torch.full_like(diff_mask, 2), diff_mask)  # Model dead, GT alive
+                                  torch.full_like(diff_mask, 3), diff_mask)  # Missing cells
+            
+            # Debug diff_mask
+            extra_cells = ((recon_state > 0.5) & (gt_state < 0.5)).sum().item()
+            missing_cells = ((recon_state < 0.5) & (gt_state > 0.5)).sum().item()
+            print(f"Step {i+1} Diff Debug: Extra={extra_cells}, Missing={missing_cells}")
             
             # Combine states for visualization
-            vis_state = recon_state.clone()
-            vis_state = torch.where(diff_mask > 0, diff_mask, vis_state)
+            # 0 = dead (white), 1 = alive (black), 2 = extra (red), 3 = missing (blue)
+            vis_state = torch.zeros_like(recon_state)
+            vis_state = torch.where(recon_state > 0.5, torch.ones_like(vis_state), vis_state)  # Alive cells
             
-            axes[1, i+1].imshow(vis_state.squeeze().cpu(), cmap=cmap, vmin=0, vmax=2)
+            # Only show differences for non-trivial cells
+            non_trivial_mask = get_non_trivial_mask(input_state, device)
+            diff_mask_non_trivial = diff_mask * non_trivial_mask.float()
+            vis_state = torch.where(diff_mask_non_trivial > 0, diff_mask_non_trivial, vis_state)  # Override with differences
+            
+            axes[1, i+1].imshow(vis_state.squeeze().cpu(), cmap=cmap, vmin=0, vmax=3)
             axes[1, i+1].axis('off')
             
             # Calculate accuracy (excluding trivial cases)
@@ -179,6 +190,20 @@ def visualize_reverse_gol(checkpoint_path: str):
             accuracy, non_trivial_mask = calculate_accuracy_excluding_trivial(
                 recon_state, gt_state, input_state, device
             )
+            
+            # Debug information
+            total_cells = recon_state.numel()
+            non_trivial_cells = non_trivial_mask.sum().item()
+            correct_cells = ((recon_state > 0.5) == (gt_state > 0.5)).sum().item()
+            correct_non_trivial = ((recon_state > 0.5) == (gt_state > 0.5) & non_trivial_mask).sum().item()
+            
+            # Simple overall accuracy for comparison
+            overall_accuracy = correct_cells / total_cells
+            
+            print(f"Step {i+1} Debug: Total={total_cells}, Non-trivial={non_trivial_cells}, "
+                  f"Correct={correct_cells}, Correct_non_trivial={correct_non_trivial}, "
+                  f"Overall_acc={overall_accuracy:.3f}, Non_trivial_acc={accuracy:.3f}")
+            
             axes[1, i+1].text(0.5, -0.1, f'{recon_state.sum().item():.0f} cells\n{accuracy:.3f} acc', 
                             ha='center', transform=axes[1, i+1].transAxes, fontsize=8)
         else:
@@ -193,7 +218,8 @@ def visualize_reverse_gol(checkpoint_path: str):
     legend_elements = [
         patches.Patch(color='white', label='Dead (Correct)'),
         patches.Patch(color='black', label='Alive (Correct)'),
-        patches.Patch(color='red', label='Difference')
+        patches.Patch(color='red', label='Extra (Model Alive, GT Dead)'),
+        patches.Patch(color='blue', label='Missing (Model Dead, GT Alive)')
     ]
     fig.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98))
     
